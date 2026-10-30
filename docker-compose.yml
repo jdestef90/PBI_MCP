@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  pbi-mcp-server:
+    build: .
+    image: pbi-mcp-server:latest
+    container_name: pbi-mcp-server
+    volumes:
+      - .:/app/workspace:rw
+    environment:
+      - PBI_WORKSPACE_PATH=/app/workspace
+      - LOG_LEVEL=INFO
+    stdin_open: true
+    tty: true
