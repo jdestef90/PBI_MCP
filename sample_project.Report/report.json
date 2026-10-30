@@ -1,0 +1,70 @@
+{
+  "config": "{\"version\":\"5.48\",\"themeCollection\":{\"baseTheme\":{\"name\":\"CY24SU02\",\"version\":\"5.48\",\"type\":2}},\"activeSectionIndex\":0}",
+  "layoutOptimization": 0,
+  "sections": [
+    {
+      "name": "ReportSection1",
+      "displayName": "Executive Summary",
+      "filters": "[]",
+      "ordinal": 0,
+      "width": 1280,
+      "height": 720,
+      "visualContainers": [
+        {
+          "x": 20,
+          "y": 20,
+          "z": 0,
+          "width": 300,
+          "height": 180,
+          "config": "{\"name\":\"vis_card_revenue\",\"layouts\":[{\"id\":0,\"position\":{\"x\":20,\"y\":20,\"z\":0,\"width\":300,\"height\":180}}],\"singleVisual\":{\"visualType\":\"card\",\"projections\":{\"Values\":[{\"queryRef\":\"Sales.Total Revenue\"}]},\"objects\":{\"general\":[{\"properties\":{\"title\":{\"expr\":{\"Literal\":{\"Value\":\"'Total Revenue'\"}}}}}]}}}",
+          "filters": "[]",
+          "query": "{\"Commands\":[{\"SemanticQueryDataShapeCommand\":{\"Query\":{\"Version\":2,\"From\":[{\"Name\":\"s\",\"Entity\":\"Sales\",\"Type\":0}],\"Select\":[{\"Measure\":{\"Expression\":{\"SourceRef\":{\"Source\":\"s\"}},\"Property\":\"Total Revenue\"},\"Name\":\"Sales.Total Revenue\",\"NativeReferenceName\":\"Total Revenue\"}]},\"Binding\":{\"Primary\":{\"Groupings\":[{\"Projections\":[0]}]}}}}]}",
+          "dataTransforms": "{\"projectionOrdering\":{\"Values\":[0]},\"queryMetadata\":{\"Select\":[{\"Restatement\":\"Total Revenue\",\"Name\":\"Sales.Total Revenue\",\"Type\":1}]}}"
+        },
+        {
+          "x": 340,
+          "y": 20,
+          "z": 1,
+          "width": 600,
+          "height": 380,
+          "config": "{\"name\":\"vis_bar_revenue_region\",\"layouts\":[{\"id\":0,\"position\":{\"x\":340,\"y\":20,\"z\":1,\"width\":600,\"height\":380}}],\"singleVisual\":{\"visualType\":\"barChart\",\"projections\":{\"Category\":[{\"queryRef\":\"Customer.Region\"}],\"Y\":[{\"queryRef\":\"Sales.Total Revenue\"}]},\"objects\":{}}}",
+          "filters": "[]",
+          "query": "{\"Commands\":[{\"SemanticQueryDataShapeCommand\":{\"Query\":{\"Version\":2,\"From\":[{\"Name\":\"c\",\"Entity\":\"Customer\",\"Type\":0},{\"Name\":\"s\",\"Entity\":\"Sales\",\"Type\":0}],\"Select\":[{\"Column\":{\"Expression\":{\"SourceRef\":{\"Source\":\"c\"}},\"Property\":\"Region\"},\"Name\":\"Customer.Region\",\"NativeReferenceName\":\"Region\"},{\"Measure\":{\"Expression\":{\"SourceRef\":{\"Source\":\"s\"}},\"Property\":\"Total Revenue\"},\"Name\":\"Sales.Total Revenue\",\"NativeReferenceName\":\"Total Revenue\"}]}}}]}",
+          "dataTransforms": "{\"queryMetadata\":{\"Select\":[{\"Restatement\":\"Region\",\"Name\":\"Customer.Region\",\"Type\":2048},{\"Restatement\":\"Total Revenue\",\"Name\":\"Sales.Total Revenue\",\"Type\":1}]}}"
+        },
+        {
+          "x": 20,
+          "y": 220,
+          "z": 2,
+          "width": 300,
+          "height": 400,
+          "config": "{\"name\":\"vis_slicer_region\",\"layouts\":[{\"id\":0,\"position\":{\"x\":20,\"y\":220,\"z\":2,\"width\":300,\"height\":400}}],\"singleVisual\":{\"visualType\":\"slicer\",\"projections\":{\"Values\":[{\"queryRef\":\"Customer.Region\"}]},\"objects\":{}}}",
+          "filters": "[]",
+          "query": "{\"Commands\":[{\"SemanticQueryDataShapeCommand\":{\"Query\":{\"Version\":2,\"From\":[{\"Name\":\"c\",\"Entity\":\"Customer\",\"Type\":0}],\"Select\":[{\"Column\":{\"Expression\":{\"SourceRef\":{\"Source\":\"c\"}},\"Property\":\"Region\"},\"Name\":\"Customer.Region\",\"NativeReferenceName\":\"Region\"}]}}}]}",
+          "dataTransforms": "{\"queryMetadata\":{\"Select\":[{\"Restatement\":\"Region\",\"Name\":\"Customer.Region\",\"Type\":2048}]}}"
+        }
+      ]
+    },
+    {
+      "name": "ReportSection2",
+      "displayName": "Details",
+      "filters": "[]",
+      "ordinal": 1,
+      "width": 1280,
+      "height": 720,
+      "visualContainers": [
+        {
+          "x": 20,
+          "y": 20,
+          "z": 0,
+          "width": 1200,
+          "height": 650,
+          "config": "{\"name\":\"vis_table_details\",\"layouts\":[{\"id\":0,\"position\":{\"x\":20,\"y\":20,\"z\":0,\"width\":1200,\"height\":650}}],\"singleVisual\":{\"visualType\":\"tableEx\",\"projections\":{\"Values\":[{\"queryRef\":\"Customer.CustomerName\"},{\"queryRef\":\"Sales.Total Revenue\"},{\"queryRef\":\"Sales.Total Cost\"}]},\"objects\":{}}}",
+          "filters": "[]",
+          "query": "{\"Commands\":[{\"SemanticQueryDataShapeCommand\":{\"Query\":{\"Version\":2,\"From\":[{\"Name\":\"c\",\"Entity\":\"Customer\",\"Type\":0},{\"Name\":\"s\",\"Entity\":\"Sales\",\"Type\":0}],\"Select\":[{\"Column\":{\"Expression\":{\"SourceRef\":{\"Source\":\"c\"}},\"Property\":\"CustomerName\"},\"Name\":\"Customer.CustomerName\"},{\"Measure\":{\"Expression\":{\"SourceRef\":{\"Source\":\"s\"}},\"Property\":\"Total Revenue\"},\"Name\":\"Sales.Total Revenue\"},{\"Measure\":{\"Expression\":{\"SourceRef\":{\"Source\":\"s\"}},\"Property\":\"Total Cost\"},\"Name\":\"Sales.Total Cost\"}]}}}]}",
+          "dataTransforms": "{\"queryMetadata\":{\"Select\":[{\"Restatement\":\"CustomerName\",\"Name\":\"Customer.CustomerName\"},{\"Restatement\":\"Total Revenue\",\"Name\":\"Sales.Total Revenue\"},{\"Restatement\":\"Total Cost\",\"Name\":\"Sales.Total Cost\"}]}}"
+        }
+      ]
+    }
+  ]
+}

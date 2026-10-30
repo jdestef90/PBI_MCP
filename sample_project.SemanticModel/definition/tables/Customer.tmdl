@@ -1,0 +1,38 @@
+table Customer
+	lineageTag: b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e
+
+	column CustomerID
+		dataType: int64
+		formatString: 0
+		lineageTag: 33333333-0000-0000-0000-000000000001
+		summarizeBy: none
+		sourceColumn: CustomerID
+
+		annotation SummarizationSetBy = Automatic
+
+	column CustomerName
+		dataType: string
+		lineageTag: 33333333-0000-0000-0000-000000000002
+		summarizeBy: none
+		sourceColumn: CustomerName
+
+		annotation SummarizationSetBy = Automatic
+
+	column Region
+		dataType: string
+		lineageTag: 33333333-0000-0000-0000-000000000003
+		summarizeBy: none
+		sourceColumn: Region
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Customer = m
+		mode: import
+		source =
+			let
+				Source = Sql.Database("localhost", "SalesDB"),
+				dbo_Customer = Source{[Schema="dbo",Item="Customer"]}[Data]
+			in
+				dbo_Customer
+
+	annotation PBI_ResultType = Table

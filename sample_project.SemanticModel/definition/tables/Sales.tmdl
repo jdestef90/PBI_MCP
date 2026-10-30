@@ -1,0 +1,67 @@
+table Sales
+	lineageTag: a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d
+
+	column OrderID
+		dataType: int64
+		formatString: 0
+		lineageTag: 11111111-0000-0000-0000-000000000001
+		summarizeBy: count
+		sourceColumn: OrderID
+
+		annotation SummarizationSetBy = Automatic
+
+	column CustomerID
+		dataType: int64
+		formatString: 0
+		lineageTag: 11111111-0000-0000-0000-000000000002
+		summarizeBy: none
+		sourceColumn: CustomerID
+
+		annotation SummarizationSetBy = Automatic
+
+	column Quantity
+		dataType: int64
+		formatString: #,##0
+		lineageTag: 11111111-0000-0000-0000-000000000003
+		summarizeBy: sum
+		sourceColumn: Quantity
+
+		annotation SummarizationSetBy = Automatic
+
+	column UnitPrice
+		dataType: decimal
+		formatString: \$#,##0.00;(\$#,##0.00);\$0.00
+		lineageTag: 11111111-0000-0000-0000-000000000004
+		summarizeBy: sum
+		sourceColumn: UnitPrice
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Line Total' = [Quantity] * [UnitPrice]
+		dataType: decimal
+		formatString: \$#,##0.00;(\$#,##0.00);\$0.00
+		lineageTag: 11111111-0000-0000-0000-000000000005
+		summarizeBy: sum
+
+		annotation SummarizationSetBy = Automatic
+
+	/// Total revenue calculated from sales transactions
+	measure 'Total Revenue' = SUMX('Sales', 'Sales'[Quantity] * 'Sales'[UnitPrice])
+		formatString: \$#,##0;(\$#,##0);\$0
+		lineageTag: 22222222-0000-0000-0000-000000000001
+
+	/// Total cost calculated across all sales
+	measure 'Total Cost' = SUMX('Sales', 'Sales'[Quantity] * 10)
+		formatString: \$#,##0;(\$#,##0);\$0
+		lineageTag: 22222222-0000-0000-0000-000000000002
+
+	partition Sales = m
+		mode: import
+		source =
+			let
+				Source = Sql.Database("localhost", "SalesDB"),
+				dbo_Sales = Source{[Schema="dbo",Item="Sales"]}[Data]
+			in
+				dbo_Sales
+
+	annotation PBI_ResultType = Table
