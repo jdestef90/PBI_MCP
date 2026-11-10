@@ -1,30 +1,48 @@
 [project]
 name = "pbi-mcp-server"
-version = "0.1.0"
-description = "A self hosted Power BI MCP server for local PBIP manipulation"
+version = "0.2.0"
+description = "Local-first MCP server for inspecting and safely editing Power BI PBIP projects"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    "mcp>=1.0.0",
-    "pydantic>=2.0.0",
-    "jmespath>=1.0.0",
-    "tmdl-parser>=0.1.0",
+  "jmespath>=1.0.1",
+  "mcp[cli]>=2.3.0,<3",
+  "pydantic>=2.12,<3",
+  "tmdl-parser>=0.2.0,<0.3",
 ]
 
-[project.optional-dependencies]
+[project.scripts]
+pbi-mcp-server = "pbi_mcp_server.main:main"
+
+[dependency-groups]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
+  "mypy>=1.18",
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "ruff>=0.14",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_server"]
+packages = ["src/pbi_mcp_server"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
 
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["pbi_mcp_server"]

@@ -26,4 +26,4 @@ COPY . .
 RUN uv pip install --system --no-deps -e .
 
 # Default command to run the MCP server
-ENTRYPOINT ["python", "-m", "mcp_server.main"]
+ENTRYPOINT ["python", "-m", "pbi_mcp_server.main"]

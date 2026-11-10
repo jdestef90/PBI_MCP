@@ -1,161 +1,91 @@
-# Power BI MCP Server (PBI_MCP)
+# PBI MCP Server
 
-A standalone Model Context Protocol (MCP) server for Power BI authoring and editing that works exclusively with local `.pbip` files (no Microsoft Cloud or Azure authentication required).
-
----
-
-## 1. Core Architecture
-
-The server implements a **Dual-Engine Architecture** to cleanly manage the two distinct data layers within a Power BI project (`.pbip`):
-
-```
-                     ┌──────────────────────────┐
-                     │   Model Context Protocol │
-                     │   (Stdio MCP Server)     │
-                     └─────────────┬────────────┘
-                                   │
-         ┌─────────────────────────┴─────────────────────────┐
-         ▼                                                   ▼
-┌──────────────────────────────┐            ┌──────────────────────────────┐
-│ Engine A: Semantic Model     │            │ Engine B: Report Layout      │
-│ (The "Brain")                │            │ (The "Body")                 │
-│ - TMDL Parser & AST          │            │ - JSON Shadow Model          │
-│ - Round-Trip Fidelity        │            │ - Path-based visual queries  │
-│ - Zero-diff formatting       │            │ - Embedded JSON decoding     │
-└──────────────┬───────────────┘            └──────────────┬───────────────┘
-               │                                           │
-               └───────────────────┬───────────────────────┘
-                                   │
-                                   ▼
-                   ┌───────────────────────────────┐
-                   │ Cross-Layer Integrity Engine  │
-                   │ - Reference-Aware Renames     │
-                   │ - Bound Identifier Rewriting  │
-                   │ - Post-Write Safety Validator │
-                   └───────────────────────────────┘
-```
-
-- **Engine A: Semantic Model (TMDL)**: Parses and serializes tabular model definitions (`.tmdl`). Provides typed Pydantic models for tables, columns, and measures, with 100% round-trip fidelity preserving indentation, comments, and whitespace to prevent noisy git diffs.
-- **Engine B: Report Layout (JSON Shadow Model)**: Ingests deeply nested `report.json` files, decodes embedded JSON strings (`config`, `query`, `dataTransforms`), and exposes a flat path-based addressing scheme and JMESPath querying.
-- **Cross-Layer Integrity & Safety Net**: Coordinates atomic renames between TMDL and report layout JSON. Prevents destructive naive substring replacement, and runs an automated syntax safety net after writes.
-- **In-Memory State Cache**: Uses `os.path.getmtime` timestamps to avoid redundant parsing across agent turns.
+Local-first MCP server for inspecting, auditing, and safely editing Power BI PBIP projects (`.SemanticModel` TMDL and `.Report` PBIR layouts).
 
 ---
 
-## 2. MCP Tools Overview
+## Highlights (v0.3.0)
 
-The server registers 11 tools over standard input/output (stdio):
+- **Consolidated `src/pbi_mcp_server/` Architecture**: Clean package hierarchy separating Semantic Model (`engine_a`), Report Layout (`engine_b`), Cross-Layer Integrity (`integrity`), Partition SQL (`tmdl_sql`), and Analyst Superpowers (`analyst`).
+- **Streamlined 20-Tool Surface**: Focused, workflow-oriented tools designed specifically for LLM coding and analytics agents without context bloat.
+- **Natural-Language Agent Workflows**:
+  - *"Find the sales revenue metric DAX and update it"*: Fuzzy measure search (`search_measures`) returning table, measure name, and DAX expression, paired with `update_measure_dax`.
+  - *"Change this line in the SQL query"*: Partition SQL extraction with line numbers (`get_table_sql`) and surgical replacements inside `Value.NativeQuery` (`update_table_sql`).
+  - *"Add or remove fields from visual X"*: Visual lookup by human-readable title or ID (`get_visual`) and role-aware field binding updates (`update_visual_fields`) that preserve 100% of existing visual styling and formatting.
+- **Power BI Analyst Toolkit**:
+  - `find_unused_objects`: Detects zombie columns and unreferenced measures across TMDL and report visuals.
+  - `format_dax`: Formats DAX to standard SQLBI conventions (uppercase functions, clean operator spacing).
+  - `generate_measure_docs`: Generates and writes `///` TMDL documentation comments for measures.
+  - `check_model_bpa`: Runs Best Practice Analyzer rules (unhidden foreign keys, bidirectional relationships, floating-point columns, missing format strings).
+- **Dry-Run First + Post-Write Auto-Rollback**: All mutations default to `dry_run=True` and automatically validate and roll back from backup if post-write structural checks fail.
 
-### Semantic Model (Engine A)
+---
+
+## MCP Tools (20 Total)
+
+### 1. Workspace Discovery & Lifecycle (3 tools)
 | Tool | Description |
 | :--- | :--- |
-| `get_model_summary(project_path?)` | Returns a high-level summary of all tables, columns, and measures without flooding context. |
-| `list_tables(project_path?)` | Lists tables with column and measure counts. |
-| `get_table_schema(table_name, project_path?)` | Retrieves full schema for a table including columns, measures, and partitions. |
-| `get_measure(table_name, measure_name, project_path?)` | Gets DAX formula, description, formatting, and lineage tag for a measure. |
-| `update_measure_dax(table_name, measure_name, new_dax, project_path?)` | Updates a measure's DAX formula in TMDL cleanly while preserving comments and whitespace. |
+| `list_workspaces(query?)` | List discovered PBIP workspaces with stable IDs, optionally filtered by query. |
+| `get_workspace(workspace?)` | Get workspace paths, validity status, and object counts. |
+| `refresh_workspaces()` | Re-scan configured workspace roots and refresh registry state. |
 
-### Report Layout (Engine B)
+### 2. Semantic Model Inspection & Search (5 tools)
 | Tool | Description |
 | :--- | :--- |
-| `list_pages(project_path?)` | Lists all report pages with names, ordinals, and visual counts. |
-| `get_page_visuals(page_name_or_id, project_path?)` | Returns flat shadow models of all visuals on a page. |
-| `get_visual_property(page_name_or_id, visual_id, property_path, project_path?)` | Query visual properties via path syntax (e.g. `position/width`, `visual_type`, `bound_fields`). |
-| `query_report_layout(jmespath_query, project_path?)` | Executes JMESPath queries across the report layout shadow model. |
+| `list_tables(workspace?)` | List tables with column/measure counts and `Value.NativeQuery` SQL status. |
+| `get_table(table_name, workspace?)` | Retrieve complete table schema (columns, measures, relationships, SQL source). |
+| `search_measures(query?, table?, workspace?)` | Fuzzy search across measure names, DAX formulas, and descriptions. |
+| `get_table_sql(table_name?, partition?, workspace?)` | Extract partition SQL query with line numbers and M context. |
+| `analyze_impact(term, workspace?)` | Cross-layer reference and visual impact analysis for any measure or column. |
 
-### Cross-Layer Integrity & Validation
+### 3. Report Layout & Visuals (3 tools)
 | Tool | Description |
 | :--- | :--- |
-| `rename_measure(table_name, old_measure_name, new_measure_name, project_path?)` | Renames a measure across TMDL and updates all bound references in `report.json` (`queryRef`, `Name`, `Measure.Property`, `Restatement`, `NativeReferenceName`, and DAX formulas). |
-| `validate_pbip_structure(project_path?)` | Runs post-write structural and syntax validation across descriptor, TMDLs, and report layout JSON. |
+| `list_report_pages(workspace?)` | List report pages with display names and visual counts. |
+| `list_visuals(page?, query?, workspace?)` | List visuals filtered by page, title, visual type, or bound field. |
+| `get_visual(visual_id_or_title, page?, workspace?)` | Resolve a visual by ID or title and inspect its role-grouped field bindings. |
+
+### 4. Safe Mutations (4 tools)
+| Tool | Description |
+| :--- | :--- |
+| `update_measure_dax(measure_name, expression, table?, workspace?, dry_run=True)` | Update a measure's DAX formula in TMDL cleanly. |
+| `update_table_sql(old_text, new_text, table_name?, partition?, expected_replacements?, workspace?, dry_run=True)` | Surgically replace lines or blocks inside a table's `Value.NativeQuery` SQL. |
+| `update_visual_fields(visual_id_or_title, add_fields?, remove_fields?, page?, workspace?, dry_run=True)` | Add or remove measures/columns on visual roles without altering formatting. |
+| `rename_measure(old_name, new_name, workspace?, dry_run=True)` | Atomically rename a measure across TMDL declarations, DAX, and report visuals. |
+
+### 5. Power BI Analyst Toolkit (4 tools)
+| Tool | Description |
+| :--- | :--- |
+| `find_unused_objects(workspace?)` | Identify unused measures and unreferenced columns across model and report. |
+| `format_dax(measure_name?, dax_expression?, table?, workspace?, dry_run=True)` | Standardize DAX formatting standalone or in-place in TMDL. |
+| `generate_measure_docs(measure_name, description?, table?, workspace?, dry_run=True)` | Generate and write `///` TMDL documentation comments for a measure. |
+| `check_model_bpa(workspace?)` | Audit the semantic model against Best Practice Analyzer rules. |
+
+### 6. Validation (1 tool)
+| Tool | Description |
+| :--- | :--- |
+| `validate_workspace(workspace?)` | Validate TMDL syntax, balanced fences, and PBIR JSON integrity. |
 
 ---
 
-## 3. Running with Docker / Docker Compose
+## Running Locally
 
-### Prerequisites
-- Docker Engine & Docker Compose
-
-### Run with Docker Compose
 ```bash
-docker compose up -d
-```
+# Run tests
+uv run pytest
 
-### Build and Run with Docker
-```bash
-# Build the image
-docker build -t pbi-mcp-server:latest .
+# Start server for a single PBIP project
+uv run pbi-mcp-server --workspace ./sample_project.pbip
 
-# Run container mounting local PBIP workspace
-docker run --rm -i \
-  -v $(pwd):/app/workspace:rw \
-  -e PBI_WORKSPACE_PATH=/app/workspace \
-  -e LOG_LEVEL=INFO \
-  pbi-mcp-server:latest
-```
-
----
-
-## 4. Local Development
-
-### Installation using uv
-```bash
-# Create virtual environment and install dependencies
-uv sync
-
-# Or install with pip
-pip install -e .
-```
-
-### Running the Server Locally
-```bash
-export PBI_WORKSPACE_PATH=$(pwd)/sample_project.pbip
-python -m mcp_server.main
-```
-
-### Running Tests
-```bash
-pytest -v
+# Start server across one or more workspace root directories
+uv run pbi-mcp-server --workspace-root "/path/to/pbip-projects"
 ```
 
 ---
 
-## 5. Integrating with MCP Clients
+## Domain & Architecture Documentation
 
-Add the server to your client configuration (e.g., Claude Desktop `claude_desktop_config.json` or Antigravity):
-
-```json
-{
-  "mcpServers": {
-    "powerbi": {
-      "command": "docker",
-      "args": [
-        "run",
-        "--rm",
-        "-i",
-        "-v",
-        "/absolute/path/to/pbip_project:/app/workspace:rw",
-        "-e",
-        "PBI_WORKSPACE_PATH=/app/workspace",
-        "pbi-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-Or running directly with Python:
-
-```json
-{
-  "mcpServers": {
-    "powerbi": {
-      "command": "python",
-      "args": ["-m", "mcp_server.main"],
-      "env": {
-        "PBI_WORKSPACE_PATH": "/absolute/path/to/pbip_project"
-      }
-    }
-  }
-}
-```
+- [`GLOSSARY.md`](GLOSSARY.md): Ubiquitous domain language for PBIP workspaces, TMDL, PBIR, and analyst concepts.
+- [`docs/adr/`](docs/adr/): Architecture Decision Records.
+- [`docs/agents/`](docs/agents/): Engineering skill configurations for issue tracking and domain docs.

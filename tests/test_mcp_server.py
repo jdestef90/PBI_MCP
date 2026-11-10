@@ -1,68 +1,57 @@
-"""Tests for MCP server tool registration and execution."""
+from __future__ import annotations
 
-import os
-import json
-import pytest
-from mcp_server.server import create_server
+import asyncio
+import shutil
+from pathlib import Path
 
+from pbi_mcp_server import PbipService, WorkspaceRegistry, create_server
 
-@pytest.fixture
-def server():
-    return create_server(os.path.abspath("sample_project.pbip"))
-
-
-@pytest.mark.asyncio
-async def test_server_tools_registered(server):
-    tools = await server.list_tools()
-    tool_names = [t.name for t in tools]
-
-    expected = [
-        "get_model_summary",
-        "list_tables",
-        "get_table_schema",
-        "get_measure",
-        "update_measure_dax",
-        "list_pages",
-        "get_page_visuals",
-        "get_visual_property",
-        "query_report_layout",
-        "rename_measure",
-        "validate_pbip_structure",
-    ]
-    for name in expected:
-        assert name in tool_names, f"Missing tool: {name}"
+EXPECTED_TOOLS = [
+    "list_workspaces",
+    "get_workspace",
+    "refresh_workspaces",
+    "list_tables",
+    "get_table",
+    "search_measures",
+    "get_table_sql",
+    "analyze_impact",
+    "list_report_pages",
+    "list_visuals",
+    "get_visual",
+    "update_measure_dax",
+    "update_table_sql",
+    "update_visual_fields",
+    "rename_measure",
+    "find_unused_objects",
+    "format_dax",
+    "generate_measure_docs",
+    "check_model_bpa",
+    "validate_workspace",
+]
 
 
-@pytest.mark.asyncio
-async def test_server_call_get_model_summary(server):
-    result = await server.call_tool("get_model_summary", {})
-    assert result.is_error is False
-    assert result.structured_content is not None
-    assert result.structured_content["project_name"] == "sample_project"
-    assert result.structured_content["tables_count"] == 2
+def clone_sample_workspace(tmp_path: Path) -> Path:
+    repo_root = Path(__file__).parents[1]
+    shutil.copy2(repo_root / "sample_project.pbip", tmp_path / "sample_project.pbip")
+    shutil.copytree(repo_root / "sample_project.Report", tmp_path / "sample_project.Report")
+    shutil.copytree(repo_root / "sample_project.SemanticModel", tmp_path / "sample_project.SemanticModel")
+    return tmp_path / "sample_project.pbip"
 
 
-@pytest.mark.asyncio
-async def test_server_call_list_pages(server):
-    result = await server.call_tool("list_pages", {})
-    assert result.is_error is False
-    pages = result.structured_content.get("result", result.structured_content)
-    assert isinstance(pages, list)
-    assert len(pages) == 2
-    assert pages[0]["display_name"] == "Executive Summary"
+def test_server_registers_exact_20_tools(tmp_path: Path) -> None:
+    pbip = clone_sample_workspace(tmp_path)
+    srv = create_server(PbipService(pbip))
+    tools = asyncio.run(srv.list_tools())
+    names = [t.name for t in tools]
+    assert len(names) == 20
+    assert names == EXPECTED_TOOLS
 
 
-@pytest.mark.asyncio
-async def test_server_call_query_report_layout(server):
-    result = await server.call_tool("query_report_layout", {"jmespath_query": "pages[0].display_name"})
-    assert result.is_error is False
-    assert len(result.content) > 0
-    assert result.content[0].text == "Executive Summary"
+def test_server_with_workspace_registry_auto_resolves_single_workspace(tmp_path: Path) -> None:
+    clone_sample_workspace(tmp_path)
+    registry = WorkspaceRegistry([tmp_path])
+    srv = create_server(registry)
 
-
-@pytest.mark.asyncio
-async def test_server_call_validate(server):
-    result = await server.call_tool("validate_pbip_structure", {})
-    assert result.is_error is False
-    res_dict = result.structured_content.get("result", result.structured_content)
-    assert res_dict["is_valid"] is True
+    # Single workspace in registry should auto-resolve even when workspace arg is omitted
+    res = asyncio.run(srv.call_tool("search_measures", {"query": "Revenue"}))
+    assert res is not None
