@@ -50,7 +50,7 @@ Local-first MCP server for inspecting, auditing, and safely editing Power BI PBI
 ### 4. Safe Mutations (4 tools)
 | Tool | Description |
 | :--- | :--- |
-| `update_measure_dax(measure_name, expression, table?, expected_current_expression?, expected_replacements?, workspace?, dry_run=True)` | Update single-line or multi-line DAX in TMDL with precondition checks and unified diff output. |
+| `update_measure_dax(measure_name, expression, table?, create_if_missing=False, format_string?, display_folder?, description?, expected_current_expression?, expected_replacements?, workspace?, dry_run=True)` | Update an existing measure's DAX or create a new measure (`create_if_missing=True`) with formatString, displayFolder, and unified diff output. |
 | `update_table_sql(old_text, new_text, table_name?, partition?, expected_replacements?, workspace?, dry_run=True)` | Surgically replace lines or blocks inside a table's `Value.NativeQuery` SQL with unified diffs. |
 | `update_visual_fields(visual_id_or_title, add_fields?, remove_fields?, page?, expected_replacements?, workspace?, dry_run=True)` | Add or remove measures/columns on visual roles without altering visual layout or styling. |
 | `rename_measure(old_name, new_name, table?, expected_replacements?, workspace?, dry_run=True)` | Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals. |
@@ -67,6 +67,21 @@ Local-first MCP server for inspecting, auditing, and safely editing Power BI PBI
 | Tool | Description |
 | :--- | :--- |
 | `validate_workspace(workspace?)` | Validate TMDL syntax, balanced fences, measure expressions, and PBIR JSON integrity. |
+
+---
+
+## MCP Resources & Prompts (Zero Tool-Surface Overhead)
+
+In addition to the 20 tools above, the server exposes **MCP Resources** (for instant context attachment) and **MCP Prompts** (for slash-command workflows in Claude Desktop, Cursor, or Antigravity):
+
+### MCP Resources
+- `pbip://workspaces`: Live JSON list of all discovered PBIP workspaces and their `workspace_id`s.
+- `pbip://workspace/{workspace}/summary`: Object counts (tables, columns, measures, relationships, partitions, calculation groups, RLS roles, pages, visuals) and BPA `health_summary`.
+- `pbip://workspace/{workspace}/bpa`: Full Best Practice Analyzer report for the workspace.
+
+### MCP Prompts
+- `workflow_model_audit(workspace?)`: Guided 4-step Semantic Model & Report Layout audit prompt.
+- `workflow_measure_update(measure_name, new_dax, workspace?)`: Guided 5-stage prompt for resolving, impact-analyzing, dry-running, applying, and validating a measure update or creation.
 
 ---
 
