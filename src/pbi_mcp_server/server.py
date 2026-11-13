@@ -236,11 +236,27 @@ def create_server(backend: Backend) -> MCPServer:
 
     @mcp.tool()
     def update_measure_dax(
-        measure_name: Annotated[str, Field(description="Exact measure name to update.")],
-        expression: Annotated[str, Field(description="Replacement DAX expression.")],
+        measure_name: Annotated[str, Field(description="Exact measure name to update or create.")],
+        expression: Annotated[str, Field(description="Replacement or new DAX expression.")],
         table: Annotated[
             str | None,
-            Field(description="Optional table name to disambiguate the measure."),
+            Field(description="Table name to disambiguate the measure (required when create_if_missing=True)."),
+        ] = None,
+        create_if_missing: Annotated[
+            bool,
+            Field(description="When true, create a new measure in the specified table if it does not already exist."),
+        ] = False,
+        format_string: Annotated[
+            str | None,
+            Field(description="Optional formatString (e.g. '$#,##0.00' or '0.0%') to set on the measure."),
+        ] = None,
+        display_folder: Annotated[
+            str | None,
+            Field(description="Optional displayFolder to organize the measure in the semantic model."),
+        ] = None,
+        description: Annotated[
+            str | None,
+            Field(description="Optional /// TMDL description comment to attach to the measure."),
         ] = None,
         expected_current_expression: Annotated[
             str | None,
@@ -253,11 +269,15 @@ def create_server(backend: Backend) -> MCPServer:
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
-        """Update a measure's DAX expression in TMDL while preserving surrounding formatting."""
+        """Update an existing measure's DAX expression in TMDL (or create a new measure when create_if_missing=True)."""
         return get_service(workspace).update_dax(
             measure_name,
             expression,
             table=table,
+            create_if_missing=create_if_missing,
+            format_string=format_string,
+            display_folder=display_folder,
+            description=description,
             expected_current_expression=expected_current_expression,
             expected_replacements=expected_replacements,
             dry_run=dry_run,
@@ -425,5 +445,57 @@ def create_server(backend: Backend) -> MCPServer:
     def validate_workspace(workspace: WorkspaceArg = None) -> list[dict[str, Any]]:
         """Run structural and syntax validation across TMDL and PBIR report JSON."""
         return get_service(workspace).validation()
+
+    # -------------------------------------------------------------------------
+    # 7. MCP Resources & Prompts (Zero tool-surface overhead)
+    # -------------------------------------------------------------------------
+
+    @mcp.resource("pbip://workspaces")
+    def resource_workspaces() -> str:
+        """JSON list of discovered PBIP workspaces."""
+        import json
+
+        return json.dumps(list_workspaces(), indent=2)
+
+    @mcp.resource("pbip://workspace/{workspace}/summary")
+    def resource_workspace_summary(workspace: str) -> str:
+        """JSON summary, object counts, and BPA health summary for a PBIP workspace."""
+        import json
+
+        ws_arg = None if workspace in {"default", "single-workspace"} else workspace
+        return json.dumps(get_workspace(ws_arg), indent=2)
+
+    @mcp.resource("pbip://workspace/{workspace}/bpa")
+    def resource_workspace_bpa(workspace: str) -> str:
+        """JSON Best Practice Analyzer report for a PBIP workspace."""
+        import json
+
+        ws_arg = None if workspace in {"default", "single-workspace"} else workspace
+        return json.dumps(check_model_bpa(ws_arg), indent=2)
+
+    @mcp.prompt()
+    def workflow_measure_update(measure_name: str, new_dax: str, workspace: str = "") -> str:
+        """Guided 5-stage prompt for safely updating or creating a DAX measure."""
+        ws_clause = f" in workspace {workspace!r}" if workspace else ""
+        return (
+            f"Execute the 'measure_lookup_and_update' workflow for measure {measure_name!r}{ws_clause}:\n"
+            f"1. Call search_measures(query={measure_name!r}) to resolve the exact measure, table, and current DAX.\n"
+            f"2. Call analyze_impact(term={measure_name!r}) to inspect upstream columns and downstream visuals.\n"
+            f"3. Call update_measure_dax(measure_name={measure_name!r}, expression={new_dax!r}, dry_run=True) and review the unified diff.\n"
+            f"4. Call update_measure_dax(measure_name={measure_name!r}, expression={new_dax!r}, dry_run=False) with expected_current_expression.\n"
+            f"5. Verify post-write validation status."
+        )
+
+    @mcp.prompt()
+    def workflow_model_audit(workspace: str = "") -> str:
+        """Guided prompt for running a comprehensive Power BI Semantic Model & Report Layout audit."""
+        ws_clause = f" for workspace {workspace!r}" if workspace else ""
+        return (
+            f"Run a comprehensive Power BI model and report audit{ws_clause}:\n"
+            f"1. Call get_workspace() to inspect object counts and overall health_summary.\n"
+            f"2. Call check_model_bpa() to identify relationship, DAX, performance, and report visual binding issues.\n"
+            f"3. Call find_unused_objects() to list unused measures, unused columns, and dead-branch objects.\n"
+            f"4. Call validate_workspace() to confirm structural integrity and summarize prioritized recommendations."
+        )
 
     return mcp

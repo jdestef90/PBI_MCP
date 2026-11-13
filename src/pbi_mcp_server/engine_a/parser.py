@@ -10,13 +10,15 @@ from ..tmdl_sql import discover_partition_metadata, discover_tmdl_sql_sources
 from ..workspace import compute_workspace_id, relative
 
 DECLARATION = re.compile(
-    r"^(?P<indent>\s*)(?P<kind>table|column|measure|calculatedColumn|relationship|partition)\s+"
+    r"^(?P<indent>\s*)(?P<kind>table|column|measure|calculatedColumn|relationship|partition|calculationItem|role|tablePermission)\s+"
     r"(?P<name>'(?:[^']|'')+'|\"[^\"]+\"|[^=\s]+)(?:\s*=\s*(?P<expr>.*))?$",
     re.IGNORECASE,
 )
 
+CALC_GROUP_RE = re.compile(r"^(?P<indent>\s*)calculationGroup\s*$", re.IGNORECASE)
+
 PROPERTY_RE = re.compile(
-    r"^(?P<indent>\s*)(?P<prop>dataType|formatString|summarizeBy|sourceColumn|fromColumn|toColumn|fromCardinality|toCardinality|crossFilteringBehavior|isActive|mode)\s*:\s*(?P<val>.+?)\s*$",
+    r"^(?P<indent>\s*)(?P<prop>dataType|formatString|displayFolder|summarizeBy|sourceColumn|fromColumn|toColumn|fromCardinality|toCardinality|crossFilteringBehavior|isActive|mode|modelPermission)\s*:\s*(?P<val>.+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -48,7 +50,7 @@ def tmdl_files(semantic_dir: Path | None) -> list[Path]:
 
 
 def _compute_qualified_name(kind: str, name: str, table: str | None) -> str:
-    if table and kind in {"column", "calculated_column", "measure"}:
+    if table and kind in {"column", "calculated_column", "measure", "calculation_item"}:
         return f"{table}[{name}]"
     if table and kind == "partition":
         return f"{table}.{name}"
@@ -63,6 +65,7 @@ def parse_file(
     ws_id = workspace_id or compute_workspace_id(root)
     objects: list[TmdlObject] = []
     current_table: str | None = None
+    current_role: TmdlObject | None = None
     current_obj: TmdlObject | None = None
     current_obj_indent: int = 0
     doc_lines: list[str] = []
@@ -103,26 +106,62 @@ def parse_file(
             doc_lines.append(stripped[3:].strip())
             continue
 
+        cg_match = CALC_GROUP_RE.match(line)
+        if cg_match and current_table:
+            _finalize_multiline()
+            indent = len(cg_match.group("indent").expandtabs(4))
+            qname = current_table
+            obj = TmdlObject(
+                kind="calculation_group",
+                name=current_table,
+                table=current_table,
+                file=relative(path, root),
+                line=number,
+                object_id=make_object_id(ws_id, "calculation_group", qname),
+                qualified_name=qname,
+            )
+            objects.append(obj)
+            current_obj = obj
+            current_obj_indent = indent
+            continue
+
         match = DECLARATION.match(line)
         if match:
             _finalize_multiline()
             raw_kind = match.group("kind").lower()
-            kind_map = {"calculatedcolumn": "calculated_column"}
-            kind = kind_map.get(raw_kind, raw_kind)
             name = unquote(match.group("name"))
             indent = len(match.group("indent").expandtabs(4))
-
-            if kind == "table":
-                current_table = name
-
-            table = (
-                current_table
-                if kind in {"column", "calculated_column", "measure", "partition"} and indent
-                else None
-            )
             expr = match.group("expr")
             if expr is not None:
                 expr = expr.strip()
+
+            if raw_kind == "tablepermission" and current_role is not None:
+                # Append RLS table permission filter expression onto the enclosing role
+                rls_clause = f"{name}: {expr}" if expr else name
+                if current_role.expression:
+                    current_role.expression = f"{current_role.expression}; {rls_clause}"
+                else:
+                    current_role.expression = rls_clause
+                continue
+
+            kind_map = {
+                "calculatedcolumn": "calculated_column",
+                "calculationitem": "calculation_item",
+            }
+            kind = kind_map.get(raw_kind, raw_kind)
+
+            if kind == "table":
+                current_table = name
+                current_role = None
+            elif kind == "role":
+                current_table = None
+
+            table = (
+                current_table
+                if kind in {"column", "calculated_column", "measure", "partition", "calculation_item"} and indent
+                else None
+            )
+            if expr is not None:
                 if expr == "```":
                     expr = ""
                     in_fenced_expr = True
@@ -131,13 +170,12 @@ def parse_file(
                     kind = "calculated_column"
                     in_multiline_dax = True
                     multiline_dax_lines = []
-                elif expr == "" and kind == "measure":
+                elif expr == "" and kind in {"measure", "calculation_item"}:
                     in_multiline_dax = True
                     multiline_dax_lines = []
                 elif expr != "" and kind == "column":
                     kind = "calculated_column"
-                elif expr != "" and kind in {"measure", "calculated_column"}:
-                    # Also allow continuation lines before properties
+                elif expr != "" and kind in {"measure", "calculated_column", "calculation_item"}:
                     in_multiline_dax = True
                     multiline_dax_lines = []
 
@@ -159,6 +197,8 @@ def parse_file(
             )
             objects.append(obj)
             current_obj = obj
+            if kind == "role":
+                current_role = obj
             current_obj_indent = indent
             continue
 
@@ -181,6 +221,8 @@ def parse_file(
                         current_obj.data_type = val
                     elif prop_name == "formatstring":
                         current_obj.format_string = val
+                    elif prop_name == "displayfolder":
+                        current_obj.display_folder = unquote(val)
                     elif prop_name == "summarizeby":
                         current_obj.summarize_by = val
                     elif prop_name == "sourcecolumn":
@@ -199,6 +241,8 @@ def parse_file(
                         current_obj.is_active = val.lower() not in {"false", "0"}
                     elif prop_name == "mode":
                         current_obj.partition_mode = val
+                    elif prop_name == "modelpermission":
+                        current_obj.model_permission = val
                     continue
 
                 flag_match = FLAG_RE.match(line)
@@ -207,7 +251,11 @@ def parse_file(
                     current_obj.is_hidden = True
                     continue
 
-                if stripped.lower().startswith("annotation ") or stripped.lower().startswith("lineageTag:"):
+                if (
+                    stripped.lower().startswith("annotation ")
+                    or stripped.lower().startswith("lineagetag:")
+                    or stripped.lower().startswith("ordinal:")
+                ):
                     _finalize_multiline()
                     continue
 
@@ -217,7 +265,7 @@ def parse_file(
                         fenced_lines = []
                     continue
 
-                if in_multiline_dax and current_obj.kind in {"measure", "calculated_column"}:
+                if in_multiline_dax and current_obj.kind in {"measure", "calculated_column", "calculation_item"}:
                     multiline_dax_lines.append(stripped)
             else:
                 _finalize_multiline()
@@ -280,6 +328,15 @@ def get_table_schema(
         for x in objects
         if x.kind == "measure" and (x.table or "").casefold() == canonical.casefold()
     ]
+    calculation_items = [
+        x.model_dump()
+        for x in objects
+        if x.kind == "calculation_item" and (x.table or "").casefold() == canonical.casefold()
+    ]
+    is_calculation_group = any(
+        x.kind == "calculation_group" and (x.table or "").casefold() == canonical.casefold()
+        for x in objects
+    )
     relationships = [
         x.model_dump()
         for x in objects
@@ -302,7 +359,7 @@ def get_table_schema(
         sql_sources = [
             s.to_summary()
             for s in discover_tmdl_sql_sources(semantic_dir)
-            if s.table.casefold() == canonical.casefold()
+            if (s.table or "").casefold() == canonical.casefold()
         ]
     else:
         sql_sources = []
@@ -314,11 +371,14 @@ def get_table_schema(
         "file": table_obj.file,
         "line": table_obj.line,
         "description": table_obj.description,
+        "is_calculation_group": is_calculation_group,
         "column_count": len(columns),
         "measure_count": len(measures),
+        "calculation_item_count": len(calculation_items),
         "partition_count": len(partitions),
         "columns": columns,
         "measures": measures,
+        "calculation_items": calculation_items,
         "relationships": relationships,
         "partitions": partitions,
         "sql_sources": sql_sources,

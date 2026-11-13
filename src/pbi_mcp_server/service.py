@@ -11,6 +11,7 @@ from .analyst import (
 )
 from .engine_a.parser import get_table_schema, parse_file, scan_model, tmdl_files
 from .engine_a.writer import (
+    create_measure_declaration,
     delete_measure_declaration,
     replace_exact_references,
     replace_measure_declaration,
@@ -18,6 +19,7 @@ from .engine_a.writer import (
     restore_backup,
     update_measure_description,
     update_measure_expression,
+    upsert_relationship_declaration,
 )
 from .engine_b.parser import (
     json_files,
@@ -109,6 +111,9 @@ class PbipService:
                 "measures": sum(x.kind == "measure" for x in objects),
                 "relationships": sum(x.kind == "relationship" for x in objects),
                 "partitions": sum(x.kind == "partition" for x in objects),
+                "calculation_groups": sum(x.kind == "calculation_group" for x in objects),
+                "calculation_items": sum(x.kind == "calculation_item" for x in objects),
+                "roles": sum(x.kind == "role" for x in objects),
                 "pages": len(list_pages(self.info.report_dir, self.info.root, workspace_id=self.info.workspace_id)),
                 "visuals": len(list_visuals(self.info.report_dir, self.info.root, workspace_id=self.info.workspace_id)),
             },
@@ -657,6 +662,10 @@ class PbipService:
         expression: str,
         table: str | None = None,
         *,
+        create_if_missing: bool = False,
+        format_string: str | None = None,
+        display_folder: str | None = None,
+        description: str | None = None,
         expected_current_expression: str | None = None,
         expected_replacements: int | None = None,
         dry_run: bool = True,
@@ -685,7 +694,9 @@ class PbipService:
         elif not matches and expected_current_expression is not None:
             raise ObjectNotFoundError(f"Measure {measure_name!r} was not found.")
 
-        target_obj_id = matches[0].get("object_id") if len(matches) == 1 else measure_name
+        target_obj_id = matches[0].get("object_id") if len(matches) == 1 else (
+            f"{self.info.workspace_id}::measure::{table}[{measure_name}]" if table else measure_name
+        )
         impact_info = self.impact(measure_name)
 
         edits: list[PendingFileEdit] = []
@@ -699,7 +710,15 @@ class PbipService:
                 ):
                     continue
             original = path.read_text(encoding="utf-8-sig")
-            changed, m_count = update_measure_expression(original, measure_name, expression)
+            changed, m_count = update_measure_expression(
+                original,
+                measure_name,
+                expression,
+                format_string=format_string,
+                display_folder=display_folder,
+            )
+            if m_count and description is not None:
+                changed, _ = update_measure_description(changed, measure_name, description)
             if m_count:
                 count += m_count
                 edits.append(
@@ -712,13 +731,49 @@ class PbipService:
                     )
                 )
 
+        if count == 0 and create_if_missing:
+            if not table:
+                raise InvalidArgumentError(
+                    f"table is required when creating new measure {measure_name!r} with create_if_missing=True."
+                )
+            for path in tmdl_files(self.info.semantic_model_dir):
+                file_objs = parse_file(path, self.info.root, workspace_id=self.info.workspace_id)
+                if any(o.kind == "table" and o.name.casefold() == table.casefold() for o in file_objs):
+                    original = path.read_text(encoding="utf-8-sig")
+                    changed, c_count = create_measure_declaration(
+                        original,
+                        measure_name,
+                        expression,
+                        format_string=format_string,
+                        display_folder=display_folder,
+                        description=description,
+                    )
+                    count += c_count
+                    edits.append(
+                        PendingFileEdit(
+                            path=path,
+                            original_text=original,
+                            updated_text=changed,
+                            replacements=c_count,
+                            reason="create measure declaration",
+                        )
+                    )
+                    break
+            if count == 0:
+                raise ObjectNotFoundError(f"Table {table!r} was not found to create measure {measure_name!r}.")
+
         warnings: list[str] = []
         if count != 1:
             warnings.append(f"Expected exactly one measure declaration; found {count}.")
 
+        op_label = (
+            f"create measure {measure_name!r} in {table!r}"
+            if (not matches and create_if_missing)
+            else f"update DAX for {measure_name!r}"
+        )
         res = execute_mutation_pipeline(
             self.info,
-            operation=f"update DAX for {measure_name!r}",
+            operation=op_label,
             target_object=target_obj_id,
             edits=edits,
             dry_run=dry_run,
@@ -735,6 +790,63 @@ class PbipService:
             target_object=target_obj_id,
         )
         return res
+
+    def upsert_relationship(
+        self,
+        relationship_name: str,
+        *,
+        from_column: str | None = None,
+        to_column: str | None = None,
+        cross_filtering: str | None = None,
+        is_active: bool | None = None,
+        from_cardinality: str | None = None,
+        to_cardinality: str | None = None,
+        create_if_missing: bool = False,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Update an existing relationship or create a new one in relationships.tmdl."""
+        if not self.info.semantic_model_dir:
+            raise ObjectNotFoundError("Semantic model directory was not found.")
+        rel_path = self.info.semantic_model_dir / "definition" / "relationships.tmdl"
+        if not rel_path.exists():
+            if not create_if_missing:
+                raise ObjectNotFoundError("relationships.tmdl does not exist in semantic model.")
+            rel_path.parent.mkdir(parents=True, exist_ok=True)
+            original = ""
+        else:
+            original = rel_path.read_text(encoding="utf-8-sig")
+
+        changed, count = upsert_relationship_declaration(
+            original,
+            relationship_name,
+            from_column=from_column,
+            to_column=to_column,
+            cross_filtering=cross_filtering,
+            is_active=is_active,
+            from_cardinality=from_cardinality,
+            to_cardinality=to_cardinality,
+            create_if_missing=create_if_missing,
+        )
+        if count == 0:
+            raise ObjectNotFoundError(f"Relationship {relationship_name!r} was not found.")
+
+        edits = [
+            PendingFileEdit(
+                path=rel_path,
+                original_text=original,
+                updated_text=changed,
+                replacements=count,
+                reason="upsert relationship declaration",
+            )
+        ]
+        return execute_mutation_pipeline(
+            self.info,
+            operation=f"upsert relationship {relationship_name!r}",
+            target_object=f"{self.info.workspace_id}::relationship::{relationship_name}",
+            edits=edits,
+            dry_run=dry_run,
+            create_backups=self.create_backups,
+        )
 
     def format_dax(
         self,

@@ -14,6 +14,9 @@ ObjectKind = Literal[
     "measure",
     "relationship",
     "partition",
+    "calculation_group",
+    "calculation_item",
+    "role",
     "page",
     "visual",
     "field_binding",
@@ -42,13 +45,24 @@ class ObjectReference(BaseModel):
 
 
 class TmdlObject(BaseModel):
-    kind: Literal["table", "column", "calculated_column", "measure", "relationship", "partition"]
+    kind: Literal[
+        "table",
+        "column",
+        "calculated_column",
+        "measure",
+        "relationship",
+        "partition",
+        "calculation_group",
+        "calculation_item",
+        "role",
+    ]
     name: str
     table: str | None = None
     expression: str | None = None
     description: str | None = None
     data_type: str | None = None
     format_string: str | None = None
+    display_folder: str | None = None
     is_hidden: bool = False
     summarize_by: str | None = None
     source_column: str | None = None
@@ -59,6 +73,7 @@ class TmdlObject(BaseModel):
     to_cardinality: str | None = None
     is_active: bool = True
     partition_mode: str | None = None
+    model_permission: str | None = None
     file: str
     line: int
     object_id: str | None = None
@@ -66,7 +81,7 @@ class TmdlObject(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         if not self.qualified_name:
-            if self.kind in {"column", "calculated_column", "measure"} and self.table:
+            if self.kind in {"column", "calculated_column", "measure", "calculation_item"} and self.table:
                 self.qualified_name = f"{self.table}[{self.name}]"
             elif self.kind == "partition" and self.table:
                 self.qualified_name = f"{self.table}/{self.name}"
