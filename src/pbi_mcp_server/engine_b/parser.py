@@ -8,8 +8,16 @@ from typing import Any
 import jmespath
 
 from ..engine_a.writer import atomic_write
-from ..models import ChangePlan, FileChange, JsonValue, VisualSummary
-from ..workspace import relative
+from ..errors import AmbiguousObjectError, InvalidArgumentError, ObjectNotFoundError
+from ..models import (
+    ChangePlan,
+    FieldBinding,
+    FileChange,
+    JsonValue,
+    VisualSummary,
+    make_object_id,
+)
+from ..workspace import compute_workspace_id, relative
 
 _DAX_FIELD_RE = re.compile(r"^'?(?P<table>[^'\[\].]+)'?\[(?P<prop>[^\]]+)\]$")
 
@@ -50,9 +58,51 @@ def parse_field_ref(raw: str) -> tuple[str, str, str]:
         table = table.strip("'\" ")
         prop = prop.strip("[]'\" ")
         return table, prop, f"{table}.{prop}"
-    raise ValueError(
+    raise InvalidArgumentError(
         f"Field reference {raw!r} must include table and field name, e.g. 'Sales[Total Revenue]' or 'Sales.Total Revenue'."
     )
+
+
+def _split_query_ref(qref: str) -> tuple[str | None, str | None]:
+    if "." in qref:
+        tbl, prop = qref.split(".", 1)
+        return tbl.strip("'\" "), prop.strip("'\"[] ")
+    m = _DAX_FIELD_RE.match(qref.strip())
+    if m:
+        return m.group("table").strip(), m.group("prop").strip()
+    return None, qref.strip() or None
+
+
+def _extract_filter_fields(filter_config: Any) -> list[str]:
+    """Extract queryRef / Table.Property strings from PBIR or legacy filter containers."""
+    fields: set[str] = set()
+    parsed = safe_json_loads(filter_config)
+    filters_list: list[Any] = []
+    if isinstance(parsed, dict):
+        filters_list = parsed.get("filters", []) if isinstance(parsed.get("filters"), list) else []
+    elif isinstance(parsed, list):
+        filters_list = parsed
+
+    for flt in filters_list:
+        if not isinstance(flt, dict):
+            continue
+        field_obj = flt.get("field") or flt.get("expression")
+        if isinstance(field_obj, dict):
+            for kind_key in ("Column", "Measure", "Aggregation", "HierarchyLevel"):
+                inner = field_obj.get(kind_key)
+                if isinstance(inner, dict):
+                    prop = inner.get("Property")
+                    expr = inner.get("Expression", {})
+                    src = expr.get("SourceRef", {}) if isinstance(expr, dict) else {}
+                    entity = src.get("Entity") or src.get("Source")
+                    if entity and prop:
+                        fields.add(f"{entity}.{prop}")
+                    elif prop:
+                        fields.add(str(prop))
+        name_val = flt.get("name") or flt.get("queryRef")
+        if isinstance(name_val, str) and "." in name_val and not name_val.lower().startswith("filter"):
+            fields.add(name_val)
+    return sorted(fields)
 
 
 def _extract_title_from_objects(objects: dict[str, Any]) -> str | None:
@@ -71,11 +121,14 @@ def _extract_title_from_objects(objects: dict[str, Any]) -> str | None:
     return None
 
 
-def _extract_pbir_visual_info(data: dict[str, Any]) -> tuple[str | None, str | None, dict[str, list[str]], list[str]]:
-    """Extract (visual_type, title, role_bindings, bound_fields) from a PBIR visual.json dict."""
+def _extract_pbir_visual_info(
+    data: dict[str, Any],
+    ws_id: str,
+) -> tuple[str | None, str | None, dict[str, list[str]], list[str], list[FieldBinding], list[str]]:
+    """Extract (visual_type, title, role_bindings, bound_fields, field_bindings, filter_fields) from a PBIR visual.json dict."""
     visual = data.get("visual") if isinstance(data.get("visual"), dict) else data
     if not isinstance(visual, dict):
-        return None, None, {}, []
+        return None, None, {}, [], [], []
 
     v_type = visual.get("visualType")
     visual_type = str(v_type) if v_type else None
@@ -86,6 +139,8 @@ def _extract_pbir_visual_info(data: dict[str, Any]) -> tuple[str | None, str | N
 
     role_bindings: dict[str, list[str]] = {}
     fields_set: set[str] = set()
+    field_bindings: list[FieldBinding] = []
+    seen_bindings: set[tuple[str, str]] = set()
 
     # Check singleVisual.projections or visual.projections
     projections = visual.get("projections")
@@ -100,6 +155,20 @@ def _extract_pbir_visual_info(data: dict[str, Any]) -> tuple[str | None, str | N
                 if refs:
                     role_bindings[str(role)] = refs
                     fields_set.update(refs)
+                    for qref in refs:
+                        key = (str(role), qref)
+                        if key not in seen_bindings:
+                            seen_bindings.add(key)
+                            tbl, prop = _split_query_ref(qref)
+                            field_bindings.append(
+                                FieldBinding(
+                                    role=str(role),
+                                    query_ref=qref,
+                                    table=tbl,
+                                    property_name=prop,
+                                    field_kind="unknown",
+                                )
+                            )
 
     # Check PBIR enhanced query.queryState.<role>.projections
     query_state = visual.get("query", {}).get("queryState", {}) if isinstance(visual.get("query"), dict) else {}
@@ -111,16 +180,57 @@ def _extract_pbir_visual_info(data: dict[str, Any]) -> tuple[str | None, str | N
                     if isinstance(item, dict):
                         qref = item.get("queryRef")
                         if qref:
-                            refs.append(str(qref))
+                            qref_str = str(qref)
+                            refs.append(qref_str)
+                            field_dict = item.get("field", {}) if isinstance(item.get("field"), dict) else {}
+                            f_kind: str = "unknown"
+                            tbl, prop = _split_query_ref(qref_str)
+                            if "Measure" in field_dict and isinstance(field_dict["Measure"], dict):
+                                f_kind = "measure"
+                                m_inner = field_dict["Measure"]
+                                prop = str(m_inner.get("Property") or prop or "")
+                                ent = m_inner.get("Expression", {}).get("SourceRef", {}).get("Entity")
+                                if ent:
+                                    tbl = str(ent)
+                            elif "Column" in field_dict and isinstance(field_dict["Column"], dict):
+                                f_kind = "column"
+                                c_inner = field_dict["Column"]
+                                prop = str(c_inner.get("Property") or prop or "")
+                                ent = c_inner.get("Expression", {}).get("SourceRef", {}).get("Entity")
+                                if ent:
+                                    tbl = str(ent)
+                            obj_id = (
+                                make_object_id(ws_id, f_kind, f"{tbl}[{prop}]")
+                                if f_kind in {"measure", "column"} and tbl and prop
+                                else None
+                            )
+                            key = (str(role), qref_str)
+                            if key not in seen_bindings:
+                                seen_bindings.add(key)
+                                field_bindings.append(
+                                    FieldBinding(
+                                        role=str(role),
+                                        query_ref=qref_str,
+                                        table=tbl,
+                                        property_name=prop,
+                                        field_kind=f_kind,  # type: ignore[arg-type]
+                                        object_id=obj_id,
+                                    )
+                                )
                 if refs:
                     role_bindings[str(role)] = refs
                     fields_set.update(refs)
 
-    return visual_type, title, role_bindings, sorted(fields_set)
+    filter_fields = _extract_filter_fields(data.get("filterConfig") or visual.get("filterConfig"))
+    return visual_type, title, role_bindings, sorted(fields_set), field_bindings, filter_fields
 
 
-def _extract_legacy_container_info(container: dict[str, Any], index: int) -> tuple[str, str | None, str | None, dict[str, list[str]], list[str]]:
-    """Extract (visual_id, visual_type, title, role_bindings, bound_fields) from a report.json visualContainer."""
+def _extract_legacy_container_info(
+    container: dict[str, Any],
+    index: int,
+    ws_id: str,
+) -> tuple[str, str | None, str | None, dict[str, list[str]], list[str], list[FieldBinding], list[str]]:
+    """Extract (visual_id, visual_type, title, role_bindings, bound_fields, field_bindings, filter_fields) from a report.json visualContainer."""
     config = safe_json_loads(container.get("config", "{}"))
     query = safe_json_loads(container.get("query", "{}"))
     if not isinstance(config, dict):
@@ -139,6 +249,39 @@ def _extract_legacy_container_info(container: dict[str, Any], index: int) -> tup
 
     role_bindings: dict[str, list[str]] = {}
     fields_set: set[str] = set()
+    field_bindings: list[FieldBinding] = []
+    seen_bindings: set[tuple[str, str]] = set()
+
+    # Build a map of queryRef -> (kind, table, prop) from Query.Select and From
+    select_meta: dict[str, tuple[str, str | None, str | None]] = {}
+    for cmd in query.get("Commands", []):
+        if not isinstance(cmd, dict):
+            continue
+        q_obj = cmd.get("SemanticQueryDataShapeCommand", {}).get("Query", {})
+        if not isinstance(q_obj, dict):
+            continue
+        alias_map = {
+            str(f.get("Name")): str(f.get("Entity"))
+            for f in q_obj.get("From", [])
+            if isinstance(f, dict) and f.get("Name") and f.get("Entity")
+        }
+        for s in q_obj.get("Select", []):
+            if not isinstance(s, dict) or "Name" not in s:
+                continue
+            qname = str(s["Name"])
+            fields_set.add(qname)
+            if "Measure" in s and isinstance(s["Measure"], dict):
+                m_inner = s["Measure"]
+                src = m_inner.get("Expression", {}).get("SourceRef", {}).get("Source")
+                tbl = alias_map.get(str(src)) if src else _split_query_ref(qname)[0]
+                prop = str(m_inner.get("Property") or _split_query_ref(qname)[1] or "")
+                select_meta[qname.casefold()] = ("measure", tbl, prop)
+            elif "Column" in s and isinstance(s["Column"], dict):
+                c_inner = s["Column"]
+                src = c_inner.get("Expression", {}).get("SourceRef", {}).get("Source")
+                tbl = alias_map.get(str(src)) if src else _split_query_ref(qname)[0]
+                prop = str(c_inner.get("Property") or _split_query_ref(qname)[1] or "")
+                select_meta[qname.casefold()] = ("column", tbl, prop)
 
     projections = single_visual.get("projections", {})
     if isinstance(projections, dict):
@@ -152,25 +295,45 @@ def _extract_legacy_container_info(container: dict[str, Any], index: int) -> tup
                 if refs:
                     role_bindings[str(role)] = refs
                     fields_set.update(refs)
+                    for qref in refs:
+                        key = (str(role), qref)
+                        if key not in seen_bindings:
+                            seen_bindings.add(key)
+                            f_kind, tbl, prop = select_meta.get(
+                                qref.casefold(),
+                                ("unknown", *_split_query_ref(qref)),
+                            )
+                            obj_id = (
+                                make_object_id(ws_id, f_kind, f"{tbl}[{prop}]")
+                                if f_kind in {"measure", "column"} and tbl and prop
+                                else None
+                            )
+                            field_bindings.append(
+                                FieldBinding(
+                                    role=str(role),
+                                    query_ref=qref,
+                                    table=tbl,
+                                    property_name=prop,
+                                    field_kind=f_kind,  # type: ignore[arg-type]
+                                    object_id=obj_id,
+                                )
+                            )
 
-    for cmd in query.get("Commands", []):
-        if not isinstance(cmd, dict):
-            continue
-        selects = (
-            cmd.get("SemanticQueryDataShapeCommand", {})
-            .get("Query", {})
-            .get("Select", [])
-        )
-        for s in selects:
-            if isinstance(s, dict) and "Name" in s:
-                fields_set.add(str(s["Name"]))
-
-    return v_id, visual_type, title, role_bindings, sorted(fields_set)
+    filter_fields = _extract_filter_fields(container.get("filters"))
+    return v_id, visual_type, title, role_bindings, sorted(fields_set), field_bindings, filter_fields
 
 
-def list_pages(report_dir: Path | None, root: Path) -> list[dict[str, Any]]:
+def list_pages(
+    report_dir: Path | None,
+    root: Path,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+    workspace_id: str | None = None,
+) -> list[dict[str, Any]]:
     if not report_dir or not report_dir.exists():
         return []
+    ws_id = workspace_id or compute_workspace_id(root)
     pages: list[dict[str, Any]] = []
 
     # 1. PBIR Enhanced format (page.json files)
@@ -180,10 +343,16 @@ def list_pages(report_dir: Path | None, root: Path) -> list[dict[str, Any]]:
         if isinstance(data, dict):
             visuals_dir = path.parent / "visuals"
             v_count = len(list(visuals_dir.rglob("visual.json"))) if visuals_dir.exists() else 0
+            p_name = str(data.get("name", path.parent.name))
+            p_disp = str(data.get("displayName", p_name))
+            filter_fields = _extract_filter_fields(data.get("filterConfig"))
             pages.append({
-                "name": str(data.get("name", path.parent.name)),
-                "display_name": str(data.get("displayName", data.get("name", path.parent.name))),
+                "name": p_name,
+                "display_name": p_disp,
+                "object_id": make_object_id(ws_id, "page", p_name),
+                "qualified_name": p_disp,
                 "visual_count": v_count,
+                "filter_fields": filter_fields,
                 "file": relative(path, root),
             })
 
@@ -195,13 +364,24 @@ def list_pages(report_dir: Path | None, root: Path) -> list[dict[str, Any]]:
             for idx, sec in enumerate(data.get("sections", [])):
                 if isinstance(sec, dict):
                     containers = sec.get("visualContainers", [])
+                    p_name = str(sec.get("name", f"Section_{idx}"))
+                    p_disp = str(sec.get("displayName", p_name))
+                    filter_fields = _extract_filter_fields(sec.get("filters"))
                     pages.append({
-                        "name": str(sec.get("name", f"Section_{idx}")),
-                        "display_name": str(sec.get("displayName", sec.get("name", f"Section_{idx}"))),
+                        "name": p_name,
+                        "display_name": p_disp,
+                        "object_id": make_object_id(ws_id, "page", p_name),
+                        "qualified_name": p_disp,
                         "ordinal": sec.get("ordinal", idx),
                         "visual_count": len(containers) if isinstance(containers, list) else 0,
+                        "filter_fields": filter_fields,
                         "file": relative(report_json, root),
                     })
+
+    if offset > 0:
+        pages = pages[offset:]
+    if limit is not None and limit >= 0:
+        pages = pages[:limit]
     return pages
 
 
@@ -210,14 +390,19 @@ def list_visuals(
     root: Path,
     page: str | None = None,
     query: str | None = None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+    workspace_id: str | None = None,
 ) -> list[VisualSummary]:
     if not report_dir or not report_dir.exists():
         return []
+    ws_id = workspace_id or compute_workspace_id(root)
     result: list[VisualSummary] = []
 
     # Map page folder/id to display_name
     page_display_map: dict[str, str] = {}
-    for p in list_pages(report_dir, root):
+    for p in list_pages(report_dir, root, workspace_id=ws_id):
         page_display_map[str(p["name"]).casefold()] = str(p["display_name"])
 
     # 1. PBIR Enhanced format (visual.json files)
@@ -228,17 +413,25 @@ def list_visuals(
             continue
         page_id = path.parents[2].name if len(path.parents) > 2 else "unknown"
         page_disp = page_display_map.get(page_id.casefold(), page_id)
-        v_type, title, role_bindings, bound_fields = _extract_pbir_visual_info(data)
+        v_id = str(data.get("name", path.parent.name))
+        v_type, title, role_bindings, bound_fields, field_bindings, filter_fields = _extract_pbir_visual_info(
+            data, ws_id
+        )
+        qname = f"{page_id}/{v_id}"
         result.append(
             VisualSummary(
                 page=page_id,
                 page_display_name=page_disp,
-                visual_id=str(data.get("name", path.parent.name)),
+                visual_id=v_id,
                 visual_type=v_type,
                 title=title,
                 role_bindings=role_bindings,
                 bound_fields=bound_fields,
+                field_bindings=field_bindings,
+                filter_fields=filter_fields,
                 file=relative(path, root),
+                object_id=make_object_id(ws_id, "visual", qname),
+                qualified_name=qname,
             )
         )
 
@@ -258,9 +451,10 @@ def list_visuals(
                 for c_idx, container in enumerate(containers):
                     if not isinstance(container, dict):
                         continue
-                    v_id, v_type, title, role_bindings, bound_fields = _extract_legacy_container_info(
-                        container, c_idx
+                    v_id, v_type, title, role_bindings, bound_fields, field_bindings, filter_fields = (
+                        _extract_legacy_container_info(container, c_idx, ws_id)
                     )
+                    qname = f"{sec_id}/{v_id}"
                     result.append(
                         VisualSummary(
                             page=sec_id,
@@ -270,7 +464,11 @@ def list_visuals(
                             title=title,
                             role_bindings=role_bindings,
                             bound_fields=bound_fields,
+                            field_bindings=field_bindings,
+                            filter_fields=filter_fields,
                             file=relative(report_json, root),
+                            object_id=make_object_id(ws_id, "visual", qname),
+                            qualified_name=qname,
                         )
                     )
 
@@ -292,8 +490,13 @@ def list_visuals(
             or q in (v.title or "").casefold()
             or q in (v.visual_type or "").casefold()
             or any(q in f.casefold() for f in v.bound_fields)
+            or any(q in f.casefold() for f in v.filter_fields)
         ]
 
+    if offset > 0:
+        result = result[offset:]
+    if limit is not None and limit >= 0:
+        result = result[:limit]
     return result
 
 
@@ -302,23 +505,47 @@ def resolve_visual(
     root: Path,
     visual_id_or_title: str,
     page: str | None = None,
+    workspace_id: str | None = None,
 ) -> VisualSummary | None:
-    visuals = list_visuals(report_dir, root, page=page)
+    visuals = list_visuals(report_dir, root, page=page, workspace_id=workspace_id)
     target = visual_id_or_title.strip().casefold()
+
+    # 0. Exact object_id or qualified_name match
+    exact_obj = [
+        v
+        for v in visuals
+        if (v.object_id or "").casefold() == target
+        or (v.qualified_name or "").casefold() == target
+    ]
+    if len(exact_obj) == 1:
+        return exact_obj[0]
 
     # 1. Exact visual_id match
     exact_id = [v for v in visuals if v.visual_id.casefold() == target]
     if len(exact_id) == 1:
         return exact_id[0]
+    if len(exact_id) > 1:
+        raise AmbiguousObjectError(
+            f"Multiple visuals match ID {visual_id_or_title!r}; specify page: "
+            + ", ".join(f"{v.visual_id} (page {v.page_display_name})" for v in exact_id),
+            candidates=[
+                {"visual_id": v.visual_id, "page": v.page, "page_display_name": v.page_display_name, "object_id": v.object_id}
+                for v in exact_id
+            ],
+        )
 
     # 2. Exact title match
     exact_title = [v for v in visuals if (v.title or "").casefold() == target]
     if len(exact_title) == 1:
         return exact_title[0]
     if len(exact_title) > 1:
-        raise ValueError(
+        raise AmbiguousObjectError(
             f"Multiple visuals match title {visual_id_or_title!r}; specify page or exact visual_id: "
-            + ", ".join(f"{v.visual_id} (page {v.page_display_name})" for v in exact_title)
+            + ", ".join(f"{v.visual_id} (page {v.page_display_name})" for v in exact_title),
+            candidates=[
+                {"visual_id": v.visual_id, "title": v.title, "page": v.page, "page_display_name": v.page_display_name, "object_id": v.object_id}
+                for v in exact_title
+            ],
         )
 
     # 3. Partial match on visual_id or title
@@ -330,9 +557,13 @@ def resolve_visual(
     if len(partial) == 1:
         return partial[0]
     if len(partial) > 1:
-        raise ValueError(
+        raise AmbiguousObjectError(
             f"Ambiguous visual selector {visual_id_or_title!r}; matched: "
-            + ", ".join(f"{v.visual_id} ({v.title or v.visual_type})" for v in partial)
+            + ", ".join(f"{v.visual_id} ({v.title or v.visual_type})" for v in partial),
+            candidates=[
+                {"visual_id": v.visual_id, "title": v.title, "page": v.page, "page_display_name": v.page_display_name, "object_id": v.object_id}
+                for v in partial
+            ],
         )
     return None
 
@@ -367,7 +598,7 @@ def update_visual_fields(
 ) -> dict[str, Any]:
     target = resolve_visual(report_dir, root, visual_id_or_title, page=page)
     if not target:
-        raise FileNotFoundError(f"Visual {visual_id_or_title!r} was not found in report.")
+        raise ObjectNotFoundError(f"Visual {visual_id_or_title!r} was not found in report.")
 
     known_measures_cf = {m.casefold() for m in (known_measures or set())}
     add_specs: list[tuple[str, str, str, str | None]] = []
@@ -393,6 +624,7 @@ def update_visual_fields(
     plan = ChangePlan(
         operation=f"update visual fields on {target.visual_id!r}",
         dry_run=dry_run,
+        target_object=target.object_id or target.visual_id,
     )
 
     if target_path.name.lower() == "report.json":
@@ -528,17 +760,22 @@ def _update_legacy_report_visual(
             container["dataTransforms"] = json.dumps(transforms, separators=(",", ":"))
 
     if modifications:
+        rel_file = relative(report_path, root)
         plan.changes.append(
             FileChange(
-                file=relative(report_path, root),
+                file=rel_file,
                 replacements=modifications,
                 reason=f"visual field bindings updated on {visual_id}",
             )
         )
+        plan.changed_files = [rel_file]
+        plan.replacement_count = modifications
+        plan.status = "dry_run" if dry_run else "applied"
         if not dry_run:
             updated_text = json.dumps(data, indent=2) + "\n"
             atomic_write(report_path, updated_text, create_backups)
     else:
+        plan.status = "no_op"
         plan.warnings.append("No visual field binding changes were needed.")
 
     return plan.model_dump()
@@ -618,17 +855,22 @@ def _update_pbir_visual_file(
                 modifications += 1
 
     if modifications:
+        rel_file = relative(visual_path, root)
         plan.changes.append(
             FileChange(
-                file=relative(visual_path, root),
+                file=rel_file,
                 replacements=modifications,
                 reason=f"visual field bindings updated on {visual_id}",
             )
         )
+        plan.changed_files = [rel_file]
+        plan.replacement_count = modifications
+        plan.status = "dry_run" if dry_run else "applied"
         if not dry_run:
             updated_text = json.dumps(data, indent=2) + "\n"
             atomic_write(visual_path, updated_text, create_backups)
     else:
+        plan.status = "no_op"
         plan.warnings.append("No visual field binding changes were needed.")
 
     return plan.model_dump()
