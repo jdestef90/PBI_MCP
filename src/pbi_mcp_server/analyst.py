@@ -4,8 +4,10 @@ import re
 from typing import Any
 
 from .engine_a.parser import scan_model
-from .engine_b.parser import json_files, list_visuals
+from .engine_b.parser import list_pages, list_visuals
+from .lineage import find_unused_model_objects
 from .models import BpaIssue, TmdlObject, WorkspaceInfo
+from .workspace import compute_workspace_id
 
 _DAX_FUNCTIONS = {
     "abs", "acos", "acosh", "addcolumns", "addmissingitems", "all", "allcrossfiltered",
@@ -65,7 +67,7 @@ _WORD_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\b")
 _BRACKET_REF_RE = re.compile(r"(?:'(?P<qtable>[^']+)'|(?P<table_bare>[A-Za-z_][A-Za-z0-9_]*))?\s*\[(?P<ref>[^\]]+)\]")
 
 
-def format_dax_string(dax: str) -> str:
+def format_dax_string(dax: str, *, multiline: bool = False) -> str:
     """Format a DAX formula to clean SQLBI-style casing and operator spacing."""
     raw = dax.strip()
     if not raw:
@@ -99,6 +101,11 @@ def format_dax_string(dax: str) -> str:
     protected = re.sub(r"\s+\)", ")", protected)
     protected = re.sub(r"\s+", " ", protected).strip()
 
+    if multiline and ("VAR " in protected or "RETURN " in protected):
+        protected = re.sub(r"\bVAR\s+", "\nVAR ", protected)
+        protected = re.sub(r"\bRETURN\s+", "\nRETURN\n    ", protected)
+        protected = protected.strip()
+
     # Restore protected tokens (removing accidental space between Table and [Col])
     for idx, token in enumerate(placeholders):
         protected = protected.replace(f"__DAX_PROTECT_{idx}__", token)
@@ -107,8 +114,15 @@ def format_dax_string(dax: str) -> str:
     return protected
 
 
-def generate_measure_docstring(measure_name: str, table_name: str | None, dax: str) -> str:
-    """Synthesize a concise TMDL description comment from a measure's DAX formula."""
+def generate_measure_docstring(
+    measure_name: str,
+    table_name: str | None,
+    dax: str,
+    *,
+    dependent_visual_count: int = 0,
+    dependent_measure_count: int = 0,
+) -> str:
+    """Synthesize a concise TMDL description comment from a measure's DAX formula and lineage."""
     expr = dax.strip()
     refs: list[str] = []
     for m in _BRACKET_REF_RE.finditer(expr):
@@ -141,7 +155,13 @@ def generate_measure_docstring(measure_name: str, table_name: str | None, dax: s
     table_clause = f" in {table_name}" if table_name else ""
     op_clause = f" using {', '.join(operations[:3])}" if operations else ""
     ref_clause = f" (references: {', '.join(refs[:5])})" if refs else ""
-    return f"Computes {measure_name}{table_clause}{op_clause}{ref_clause}."
+    usage_parts: list[str] = []
+    if dependent_measure_count > 0:
+        usage_parts.append(f"{dependent_measure_count} measure(s)")
+    if dependent_visual_count > 0:
+        usage_parts.append(f"{dependent_visual_count} visual(s)")
+    usage_clause = f" Used by {' and '.join(usage_parts)}." if usage_parts else ""
+    return f"Computes {measure_name}{table_clause}{op_clause}{ref_clause}.{usage_clause}"
 
 
 def _normalize_rel_endpoint(endpoint: str | None) -> tuple[str, str] | None:
@@ -153,107 +173,28 @@ def _normalize_rel_endpoint(endpoint: str | None) -> tuple[str, str] | None:
 
 def find_unused_objects(info: WorkspaceInfo) -> dict[str, Any]:
     """Identify unreferenced measures and columns across the Semantic Model and Report Layout."""
-    objects = scan_model(info.semantic_model_dir, info.root)
-    measures = [x for x in objects if x.kind == "measure"]
-    columns = [x for x in objects if x.kind in {"column", "calculated_column"}]
-    relationships = [x for x in objects if x.kind == "relationship"]
-    visuals = list_visuals(info.report_dir, info.root)
-
-    # Collect all report JSON content for filter/reference fallback
-    report_texts = [p.read_text(encoding="utf-8-sig").casefold() for p in json_files(info.report_dir)]
-    visual_bound_cf = {f.casefold() for v in visuals for f in v.bound_fields}
-    visual_prop_cf = {f.split(".")[-1].casefold() for f in visual_bound_cf}
-
-    # Collect relationship columns: (table_cf, col_cf)
-    rel_columns_cf: set[tuple[str, str]] = set()
-    for rel in relationships:
-        for ep in (rel.from_column, rel.to_column):
-            parsed = _normalize_rel_endpoint(ep)
-            if parsed:
-                rel_columns_cf.add((parsed[0].casefold(), parsed[1].casefold()))
-
-    # Collect DAX references from all measures and calculated columns
-    # Each item is (owner_kind, owner_table_cf, owner_name_cf, referenced_table_cf_or_none, referenced_name_cf)
-    dax_refs: list[tuple[str, str, str, str | None, str]] = []
-    for obj in objects:
-        if obj.kind in {"measure", "calculated_column"} and obj.expression:
-            owner_tbl = (obj.table or "").casefold()
-            owner_name = obj.name.casefold()
-            for m in _BRACKET_REF_RE.finditer(obj.expression):
-                ref_tbl = (m.group("qtable") or m.group("table_bare") or "").strip().casefold() or None
-                ref_name = m.group("ref").strip().casefold()
-                dax_refs.append((obj.kind, owner_tbl, owner_name, ref_tbl, ref_name))
-
-    unused_measures: list[dict[str, Any]] = []
-    for m_obj in measures:
-        m_name_cf = m_obj.name.casefold()
-        m_tbl_cf = (m_obj.table or "").casefold()
-        qref_cf = f"{m_tbl_cf}.{m_name_cf}"
-
-        in_visual = qref_cf in visual_bound_cf or m_name_cf in visual_prop_cf
-        in_report_json = any(
-            f'"{m_name_cf}"' in rtext or f".{m_name_cf}\"" in rtext for rtext in report_texts
-        )
-        in_other_dax = any(
-            ref_name == m_name_cf and not (o_kind == "measure" and o_name == m_name_cf)
-            for o_kind, _o_tbl, o_name, _ref_tbl, ref_name in dax_refs
-        )
-
-        if not (in_visual or in_report_json or in_other_dax):
-            unused_measures.append({
-                "name": m_obj.name,
-                "table": m_obj.table,
-                "file": m_obj.file,
-                "line": m_obj.line,
-            })
-
-    unused_columns: list[dict[str, Any]] = []
-    for c_obj in columns:
-        c_name_cf = c_obj.name.casefold()
-        c_tbl_cf = (c_obj.table or "").casefold()
-        qref_cf = f"{c_tbl_cf}.{c_name_cf}"
-
-        in_rel = (c_tbl_cf, c_name_cf) in rel_columns_cf
-        in_visual = qref_cf in visual_bound_cf
-        in_report_json = any(f'"{qref_cf}"' in rtext for rtext in report_texts)
-        in_dax = any(
-            ref_name == c_name_cf
-            and (ref_tbl is None or ref_tbl == c_tbl_cf)
-            and not (o_kind == c_obj.kind and o_tbl == c_tbl_cf and o_name == c_name_cf)
-            for o_kind, o_tbl, o_name, ref_tbl, ref_name in dax_refs
-        )
-
-        if not (in_rel or in_visual or in_report_json or in_dax):
-            unused_columns.append({
-                "name": c_obj.name,
-                "kind": c_obj.kind,
-                "table": c_obj.table,
-                "file": c_obj.file,
-                "line": c_obj.line,
-            })
-
-    return {
-        "counts": {
-            "unused_measures": len(unused_measures),
-            "unused_columns": len(unused_columns),
-            "total_unused": len(unused_measures) + len(unused_columns),
-        },
-        "unused_measures": unused_measures,
-        "unused_columns": unused_columns,
-    }
+    return find_unused_model_objects(info)
 
 
 def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
-    """Run Best Practice Analyzer rules against the Semantic Model."""
-    objects = scan_model(info.semantic_model_dir, info.root)
+    """Run Best Practice Analyzer rules against the Semantic Model and Report Layout."""
+    ws_id = info.workspace_id or compute_workspace_id(info.root, info.pbip_file)
+    objects = scan_model(info.semantic_model_dir, info.root, workspace_id=ws_id)
     issues: list[BpaIssue] = []
 
     columns_by_key: dict[tuple[str, str], TmdlObject] = {}
+    measures_by_name_cf: dict[str, TmdlObject] = {}
+    measures_by_key: dict[tuple[str, str], TmdlObject] = {}
+
     for obj in objects:
         if obj.kind in {"column", "calculated_column"} and obj.table:
             columns_by_key[(obj.table.casefold(), obj.name.casefold())] = obj
+        elif obj.kind == "measure":
+            measures_by_name_cf[obj.name.casefold()] = obj
+            if obj.table:
+                measures_by_key[(obj.table.casefold(), obj.name.casefold())] = obj
 
-    # Rule 1 & 2: Relationship checks
+    # Rule 1, 2, 7, 8: Relationship checks
     for rel in [x for x in objects if x.kind == "relationship"]:
         if (rel.cross_filtering or "").casefold() == "bothdirections":
             issues.append(
@@ -263,26 +204,63 @@ def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
                     category="Relationships",
                     object_type="relationship",
                     object_name=rel.name,
+                    object_id=rel.object_id,
                     message=f"Relationship {rel.name!r} uses bidirectional cross-filtering.",
                     recommendation="Prefer single-direction filtering and use CROSSFILTER inside specific measures when needed.",
                     file=rel.file,
                 )
             )
+        if (
+            (rel.from_cardinality or "").casefold() == "many"
+            and (rel.to_cardinality or "").casefold() == "many"
+        ):
+            issues.append(
+                BpaIssue(
+                    rule_id="BPA_MANY_TO_MANY_RELATIONSHIP",
+                    severity="warning",
+                    category="Relationships",
+                    object_type="relationship",
+                    object_name=rel.name,
+                    object_id=rel.object_id,
+                    message=f"Relationship {rel.name!r} uses many-to-many cardinality.",
+                    recommendation="Introduce a bridging dimension table to avoid ambiguous filter propagation.",
+                    file=rel.file,
+                )
+            )
+
         from_ep = _normalize_rel_endpoint(rel.from_column)
-        if from_ep:
-            fk_col = columns_by_key.get((from_ep[0].casefold(), from_ep[1].casefold()))
-            if fk_col and not fk_col.is_hidden:
+        to_ep = _normalize_rel_endpoint(rel.to_column)
+        for ep_name, ep in (("fromColumn", from_ep), ("toColumn", to_ep)):
+            if not ep:
+                continue
+            col_obj = columns_by_key.get((ep[0].casefold(), ep[1].casefold()))
+            if not col_obj:
+                issues.append(
+                    BpaIssue(
+                        rule_id="BPA_BROKEN_RELATIONSHIP_ENDPOINT",
+                        severity="error",
+                        category="Relationships",
+                        object_type="relationship",
+                        object_name=rel.name,
+                        object_id=rel.object_id,
+                        message=f"Relationship {rel.name!r} {ep_name} references missing column '{ep[0]}[{ep[1]}]'.",
+                        recommendation="Update or remove the broken relationship endpoint in relationships.tmdl.",
+                        file=rel.file,
+                    )
+                )
+            elif ep_name == "fromColumn" and not col_obj.is_hidden:
                 issues.append(
                     BpaIssue(
                         rule_id="BPA_UNHIDDEN_FOREIGN_KEY",
                         severity="warning",
                         category="Maintenance",
                         object_type="column",
-                        object_name=fk_col.name,
-                        table=fk_col.table,
-                        message=f"Foreign key column '{fk_col.table}[{fk_col.name}]' used in relationship {rel.name!r} is visible.",
+                        object_name=col_obj.name,
+                        table=col_obj.table,
+                        object_id=col_obj.object_id,
+                        message=f"Foreign key column '{col_obj.table}[{col_obj.name}]' used in relationship {rel.name!r} is visible.",
                         recommendation="Hide foreign key columns on the many-side of relationships so users filter via dimension tables.",
-                        file=fk_col.file,
+                        file=col_obj.file,
                     )
                 )
 
@@ -297,6 +275,7 @@ def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
                     object_type="measure",
                     object_name=m.name,
                     table=m.table,
+                    object_id=m.object_id,
                     message=f"Measure '{m.name}' has no /// documentation description.",
                     recommendation="Use generate_measure_docs to add a TMDL /// description comment.",
                     file=m.file,
@@ -311,6 +290,7 @@ def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
                     object_type="measure",
                     object_name=m.name,
                     table=m.table,
+                    object_id=m.object_id,
                     message=f"Measure '{m.name}' is missing an explicit formatString.",
                     recommendation="Specify a formatString (e.g. '#,##0' or '$#,##0.00') for consistent visual rendering.",
                     file=m.file,
@@ -325,13 +305,14 @@ def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
                     object_type="measure",
                     object_name=m.name,
                     table=m.table,
+                    object_id=m.object_id,
                     message=f"Measure '{m.name}' uses the '/' division operator directly.",
                     recommendation="Use DIVIDE(numerator, denominator) to handle division-by-zero safely.",
                     file=m.file,
                 )
             )
 
-    # Rule 5: Column data types
+    # Rule 5 & 9: Column data types and calculated column complexity
     for col in [x for x in objects if x.kind in {"column", "calculated_column"}]:
         if (col.data_type or "").casefold() == "double":
             issues.append(
@@ -342,18 +323,126 @@ def check_model_bpa(info: WorkspaceInfo) -> dict[str, Any]:
                     object_type=col.kind,
                     object_name=col.name,
                     table=col.table,
+                    object_id=col.object_id,
                     message=f"Column '{col.table}[{col.name}]' uses floating-point 'double' dataType.",
                     recommendation="Use 'decimal' (Fixed Decimal Currency) or 'int64' to prevent floating-point rounding inaccuracies.",
                     file=col.file,
                 )
             )
+        if col.kind == "calculated_column" and col.expression:
+            upper_expr = col.expression.upper()
+            if any(fn in upper_expr for fn in ("SUMX(", "FILTER(", "CALCULATE(", "RELATEDTABLE(", "LOOKUPVALUE(")):
+                issues.append(
+                    BpaIssue(
+                        rule_id="BPA_CALCULATED_COLUMN_COMPLEXITY",
+                        severity="warning",
+                        category="Performance",
+                        object_type="calculated_column",
+                        object_name=col.name,
+                        table=col.table,
+                        object_id=col.object_id,
+                        message=f"Calculated column '{col.table}[{col.name}]' uses context transition or table scan functions.",
+                        recommendation="Push calculated column logic upstream to SQL/Power Query or convert to a DAX measure.",
+                        file=col.file,
+                    )
+                )
+
+    # Rule 10, 11, 12: Report Layout checks (broken visual bindings, empty pages, duplicate visuals)
+    if info.report_dir and info.report_dir.exists() and objects:
+        pages = list_pages(info.report_dir, info.root, workspace_id=ws_id)
+        visuals = list_visuals(info.report_dir, info.root, workspace_id=ws_id)
+
+        for p in pages:
+            if p.get("visual_count", 0) == 0:
+                issues.append(
+                    BpaIssue(
+                        rule_id="BPA_EMPTY_REPORT_PAGE",
+                        severity="info",
+                        category="Report",
+                        object_type="page",
+                        object_name=str(p.get("display_name") or p.get("name")),
+                        object_id=p.get("object_id"),
+                        message=f"Report page '{p.get('display_name') or p.get('name')}' contains 0 visuals.",
+                        recommendation="Remove unused blank pages or populate with visuals before publishing.",
+                        file=p.get("file"),
+                    )
+                )
+
+        seen_visual_signatures: dict[tuple[str, str, tuple[str, ...]], str] = {}
+        for v in visuals:
+            # Check for broken bindings
+            for qref in v.bound_fields:
+                if "." not in qref:
+                    continue
+                tbl, prop = qref.split(".", 1)
+                t_cf = tbl.strip("'\" ").casefold()
+                p_cf = prop.strip("'\"[] ").casefold()
+                has_col = (t_cf, p_cf) in columns_by_key
+                has_meas = (t_cf, p_cf) in measures_by_key or p_cf in measures_by_name_cf
+                if not has_col and not has_meas:
+                    issues.append(
+                        BpaIssue(
+                            rule_id="BPA_BROKEN_VISUAL_BINDING",
+                            severity="error",
+                            category="Report",
+                            object_type="visual",
+                            object_name=v.visual_id,
+                            object_id=v.object_id,
+                            message=f"Visual '{v.title or v.visual_id}' on page '{v.page_display_name}' binds to missing model field '{qref}'.",
+                            recommendation="Use update_visual_fields to remove the stale field binding or bind the replacement field.",
+                            file=v.file,
+                        )
+                    )
+
+            # Check for duplicate visuals on the same page with identical type and non-empty bound fields
+            if v.visual_type and v.bound_fields:
+                sig = (v.page.casefold(), v.visual_type.casefold(), tuple(sorted(f.casefold() for f in v.bound_fields)))
+                if sig in seen_visual_signatures:
+                    first_vis_id = seen_visual_signatures[sig]
+                    issues.append(
+                        BpaIssue(
+                            rule_id="BPA_DUPLICATE_VISUAL",
+                            severity="info",
+                            category="Report",
+                            object_type="visual",
+                            object_name=v.visual_id,
+                            object_id=v.object_id,
+                            message=(
+                                f"Visual '{v.title or v.visual_id}' on page '{v.page_display_name}' has identical "
+                                f"type ({v.visual_type}) and field bindings as visual '{first_vis_id}'."
+                            ),
+                            recommendation="Consolidate duplicate visuals on the same report page.",
+                            file=v.file,
+                        )
+                    )
+                else:
+                    seen_visual_signatures[sig] = v.visual_id
+
+    by_severity = {
+        "error": sum(i.severity == "error" for i in issues),
+        "warning": sum(i.severity == "warning" for i in issues),
+        "info": sum(i.severity == "info" for i in issues),
+    }
+    by_category: dict[str, int] = {}
+    for i in issues:
+        by_category[i.category] = by_category.get(i.category, 0) + 1
+
+    health_status = (
+        "critical"
+        if by_severity["error"] > 0
+        else ("needs_attention" if by_severity["warning"] > 0 else "healthy")
+    )
 
     return {
         "issue_count": len(issues),
-        "by_severity": {
-            "error": sum(i.severity == "error" for i in issues),
-            "warning": sum(i.severity == "warning" for i in issues),
-            "info": sum(i.severity == "info" for i in issues),
+        "by_severity": by_severity,
+        "by_category": by_category,
+        "health_summary": {
+            "status": health_status,
+            "error_count": by_severity["error"],
+            "warning_count": by_severity["warning"],
+            "info_count": by_severity["info"],
+            "top_recommendations": [i.recommendation for i in issues[:3]],
         },
         "issues": [i.model_dump() for i in issues],
     }

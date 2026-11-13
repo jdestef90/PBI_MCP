@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .parser import DECLARATION, quote_name, unquote
+from .parser import DECLARATION, PROPERTY_RE, FLAG_RE, quote_name, unquote
 
 
 def atomic_write(path: Path, text: str, create_backup: bool = True) -> None:
@@ -47,21 +47,76 @@ def replace_measure_declaration(text: str, old_name: str, new_name: str) -> tupl
     return "".join(lines), count
 
 
+def _is_property_or_meta_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if PROPERTY_RE.match(line) or FLAG_RE.match(line):
+        return True
+    lower = stripped.lower()
+    return (
+        lower.startswith("annotation ")
+        or lower.startswith("lineagetag:")
+        or lower.startswith("changedproperty")
+        or lower.startswith("formatstringdefinition")
+        or lower.startswith("///")
+        or DECLARATION.match(line) is not None
+    )
+
+
 def update_measure_expression(text: str, measure_name: str, expression: str) -> tuple[str, int]:
     lines = text.splitlines(keepends=True)
     count = 0
-    for index, line in enumerate(lines):
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         body = line.rstrip("\r\n")
-        ending = line[len(body) :]
+        ending = line[len(body) :] or "\n"
         match = DECLARATION.match(body)
-        if not match or match.group("kind").lower() != "measure":
+        if not match or match.group("kind").lower() != "measure" or unquote(match.group("name")) != measure_name:
+            out.append(line)
+            i += 1
             continue
-        if unquote(match.group("name")) != measure_name:
-            continue
+
+        indent_str = match.group("indent")
+        decl_indent = len(indent_str.expandtabs(4))
         prefix = body[: match.start("name")]
-        lines[index] = f"{prefix}{match.group('name')} = {expression}{ending}"
+        old_expr = (match.group("expr") or "").strip()
+
+        expr_lines = expression.strip().splitlines()
+        if len(expr_lines) <= 1:
+            single_expr = expr_lines[0] if expr_lines else ""
+            out.append(f"{prefix}{match.group('name')} = {single_expr}{ending}")
+        else:
+            out.append(f"{prefix}{match.group('name')} = ```{ending}")
+            body_indent = indent_str + ("\t" if "\t" in indent_str else "    ")
+            for eline in expr_lines:
+                out.append(f"{body_indent}{eline}{ending}")
+            out.append(f"{indent_str}```{ending}")
+
         count += 1
-    return "".join(lines), count
+        i += 1
+
+        # Skip old continuation lines if the measure had a fenced or multiline block
+        if old_expr == "```":
+            while i < len(lines):
+                if lines[i].strip() == "```":
+                    i += 1
+                    break
+                i += 1
+        else:
+            while i < len(lines):
+                next_line = lines[i]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    break
+                next_indent = len(next_line[: len(next_line) - len(next_line.lstrip())].expandtabs(4))
+                if next_indent <= decl_indent or _is_property_or_meta_line(next_line):
+                    break
+                i += 1
+
+    return "".join(out), count
 
 
 def update_measure_description(text: str, measure_name: str, description: str) -> tuple[str, int]:

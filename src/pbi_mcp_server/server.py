@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from mcp.server import MCPServer
 from pydantic import Field
 
+from .errors import AmbiguousWorkspaceError, WorkspaceNotFoundError
 from .service import PbipService
 from .workspace_registry import WorkspaceRegistry
 
@@ -27,6 +28,14 @@ DryRunArg = Annotated[
         )
     ),
 ]
+LimitArg = Annotated[
+    int | None,
+    Field(description="Optional maximum number of items to return."),
+]
+OffsetArg = Annotated[
+    int,
+    Field(description="Optional 0-based pagination offset. Defaults to 0."),
+]
 
 
 def create_server(backend: Backend) -> MCPServer:
@@ -40,9 +49,18 @@ def create_server(backend: Backend) -> MCPServer:
             workspaces = backend.list_workspaces()
             if len(workspaces) == 1:
                 return backend.get_service(workspaces[0]["workspace_id"])
-            raise ValueError(
+            if not workspaces:
+                raise WorkspaceNotFoundError(
+                    "No PBIP workspaces were discovered under configured workspace roots. "
+                    "Call refresh_workspaces or verify --workspace-root."
+                )
+            raise AmbiguousWorkspaceError(
                 "workspace is required when multiple workspaces are registered. "
-                "Call list_workspaces first and pass workspace_id or workspace name."
+                "Call list_workspaces first and pass workspace_id or workspace name.",
+                candidates=[
+                    {"workspace_id": w["workspace_id"], "name": w["name"], "root": w["root"]}
+                    for w in workspaces
+                ],
             )
         return backend.get_service(workspace)
 
@@ -56,14 +74,16 @@ def create_server(backend: Backend) -> MCPServer:
             str | None,
             Field(description="Optional case-insensitive filter on workspace name or path."),
         ] = None,
+        limit: LimitArg = None,
+        offset: OffsetArg = 0,
     ) -> list[dict[str, Any]]:
         """List discovered PBIP workspaces, optionally filtered by query."""
         if isinstance(backend, WorkspaceRegistry):
-            return backend.list_workspaces(query=query)
+            return backend.list_workspaces(query=query, limit=limit, offset=offset)
         pbip_file = backend.info.pbip_file
         name = pbip_file.stem if pbip_file else backend.info.root.name
         item = {
-            "workspace_id": "single-workspace",
+            "workspace_id": backend.info.workspace_id or "single-workspace",
             "name": name,
             "workspace": name,
             "pbip_file": str(pbip_file) if pbip_file else None,
@@ -73,16 +93,21 @@ def create_server(backend: Backend) -> MCPServer:
         }
         if query and query.strip().casefold() not in "\n".join(str(v) for v in item.values()).casefold():
             return []
-        return [item]
+        items = [item]
+        if offset > 0:
+            items = items[offset:]
+        if limit is not None and limit >= 0:
+            items = items[:limit]
+        return items
 
     @mcp.tool()
     def get_workspace(workspace: WorkspaceArg = None) -> dict[str, Any]:
         """Get metadata and object counts for a PBIP workspace."""
         svc = get_service(workspace)
         summary = svc.summary()
-        if isinstance(backend, WorkspaceRegistry) and workspace:
-            meta = backend.get_workspace(workspace)
-            return {**meta, "summary": summary}
+        if isinstance(backend, WorkspaceRegistry):
+            meta = backend.get_workspace(workspace or summary["workspace_id"])
+            return {**meta, "summary": summary, "diagnostics": backend.diagnostics.model_dump()}
         return summary
 
     @mcp.tool()
@@ -97,9 +122,13 @@ def create_server(backend: Backend) -> MCPServer:
     # -------------------------------------------------------------------------
 
     @mcp.tool()
-    def list_tables(workspace: WorkspaceArg = None) -> list[dict[str, Any]]:
+    def list_tables(
+        workspace: WorkspaceArg = None,
+        limit: LimitArg = None,
+        offset: OffsetArg = 0,
+    ) -> list[dict[str, Any]]:
         """List all tables in the semantic model with column/measure counts and native SQL status."""
-        return get_service(workspace).list_tables()
+        return get_service(workspace).list_tables(limit=limit, offset=offset)
 
     @mcp.tool()
     def get_table(
@@ -120,9 +149,13 @@ def create_server(backend: Backend) -> MCPServer:
             Field(description="Optional table name filter."),
         ] = None,
         workspace: WorkspaceArg = None,
+        limit: LimitArg = None,
+        offset: OffsetArg = 0,
     ) -> list[dict[str, Any]]:
         """Find measures across the semantic model and return their table, name, DAX expression, and description."""
-        return get_service(workspace).search_measures(query=query, table=table)
+        return get_service(workspace).search_measures(
+            query=query, table=table, limit=limit, offset=offset
+        )
 
     @mcp.tool()
     def get_table_sql(
@@ -155,9 +188,13 @@ def create_server(backend: Backend) -> MCPServer:
     # -------------------------------------------------------------------------
 
     @mcp.tool()
-    def list_report_pages(workspace: WorkspaceArg = None) -> list[dict[str, Any]]:
+    def list_report_pages(
+        workspace: WorkspaceArg = None,
+        limit: LimitArg = None,
+        offset: OffsetArg = 0,
+    ) -> list[dict[str, Any]]:
         """List all report pages with their display names and visual counts."""
-        return get_service(workspace).pages()
+        return get_service(workspace).pages(limit=limit, offset=offset)
 
     @mcp.tool()
     def list_visuals(
@@ -170,9 +207,13 @@ def create_server(backend: Backend) -> MCPServer:
             Field(description="Optional search term matching visual title, visual type, ID, or bound field."),
         ] = None,
         workspace: WorkspaceArg = None,
+        limit: LimitArg = None,
+        offset: OffsetArg = 0,
     ) -> list[dict[str, Any]]:
         """List visuals in the report with their titles, types, and field bindings."""
-        return get_service(workspace).visuals(page=page, query=query)
+        return get_service(workspace).visuals(
+            page=page, query=query, limit=limit, offset=offset
+        )
 
     @mcp.tool()
     def get_visual(
@@ -201,6 +242,14 @@ def create_server(backend: Backend) -> MCPServer:
             str | None,
             Field(description="Optional table name to disambiguate the measure."),
         ] = None,
+        expected_current_expression: Annotated[
+            str | None,
+            Field(description="Optional precondition guard: current DAX expression that must match before write."),
+        ] = None,
+        expected_replacements: Annotated[
+            int | None,
+            Field(description="Optional guard requiring an exact number of matches."),
+        ] = None,
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
@@ -209,6 +258,8 @@ def create_server(backend: Backend) -> MCPServer:
             measure_name,
             expression,
             table=table,
+            expected_current_expression=expected_current_expression,
+            expected_replacements=expected_replacements,
             dry_run=dry_run,
         )
 
@@ -264,6 +315,10 @@ def create_server(backend: Backend) -> MCPServer:
             str | None,
             Field(description="Optional page name or ID."),
         ] = None,
+        expected_replacements: Annotated[
+            int | None,
+            Field(description="Optional guard requiring an exact number of field binding modifications."),
+        ] = None,
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
@@ -273,6 +328,7 @@ def create_server(backend: Backend) -> MCPServer:
             add_fields=add_fields,
             remove_fields=remove_fields,
             page=page,
+            expected_replacements=expected_replacements,
             dry_run=dry_run,
         )
 
@@ -280,11 +336,25 @@ def create_server(backend: Backend) -> MCPServer:
     def rename_measure(
         old_name: Annotated[str, Field(description="Existing measure name.")],
         new_name: Annotated[str, Field(description="New measure name.")],
+        table: Annotated[
+            str | None,
+            Field(description="Optional table name to disambiguate the measure."),
+        ] = None,
+        expected_replacements: Annotated[
+            int | None,
+            Field(description="Optional guard requiring an exact number of replacements."),
+        ] = None,
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
         """Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals."""
-        return get_service(workspace).rename_measure(old_name, new_name, dry_run=dry_run)
+        return get_service(workspace).rename_measure(
+            old_name,
+            new_name,
+            table=table,
+            expected_replacements=expected_replacements,
+            dry_run=dry_run,
+        )
 
     # -------------------------------------------------------------------------
     # 5. Power BI Analyst Superpowers (4 tools)

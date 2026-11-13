@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 from pathlib import Path
 
+from .logging_utils import configure_logging
 from .server import create_server
 from .service import PbipService
 from .workspace_registry import WorkspaceRegistry
@@ -50,10 +50,7 @@ def create_backups_enabled() -> bool:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging()
 
     create_backups = create_backups_enabled()
 
