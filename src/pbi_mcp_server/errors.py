@@ -27,14 +27,26 @@ class PbiMcpError(Exception):
         *,
         code: ErrorCode | None = None,
         details: dict[str, Any] | None = None,
+        candidates: list[dict[str, Any]] | None = None,
+        expected: Any = None,
+        actual: Any = None,
         remediation: str | None = None,
         stage: str | None = None,
+        **extra_details: Any,
     ) -> None:
         super().__init__(message)
         if code is not None:
             self.code = code
         self.message = message
-        self.details: dict[str, Any] = details or {}
+        merged_details: dict[str, Any] = dict(details or {})
+        if candidates is not None:
+            merged_details["candidates"] = candidates
+        if expected is not None:
+            merged_details["expected"] = expected
+        if actual is not None:
+            merged_details["actual"] = actual
+        merged_details.update(extra_details)
+        self.details = merged_details
         self.remediation = remediation
         self.stage = stage
 

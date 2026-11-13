@@ -7,9 +7,9 @@ from .models import WorkspaceInfo
 from .pbip_references import canonical_path_key, normalize_platform_path, read_pbip_references
 
 
-def compute_workspace_id(path: Path | str) -> str:
+def compute_workspace_id(path: Path | str, pbip_file: Path | str | None = None) -> str:
     """Compute a deterministic workspace ID from the canonical path key."""
-    key = canonical_path_key(path)
+    key = canonical_path_key(pbip_file if pbip_file is not None else path)
     return "pbip-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 

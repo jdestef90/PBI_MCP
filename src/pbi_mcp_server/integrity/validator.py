@@ -9,7 +9,7 @@ from ..engine_b.parser import json_files
 from ..models import ValidationIssue
 from ..workspace import WorkspaceInfo, relative
 
-_FENCE_RE = re.compile(r"(?m)^[ \t]*(?:source\s*=\s*)?```[ \t]*$")
+_FENCE_RE = re.compile(r"(?m)^[ \t]*(?:[^\r\n=]+=\s*)?```[ \t]*$")
 
 
 def validate(info: WorkspaceInfo) -> list[ValidationIssue]:

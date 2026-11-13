@@ -107,7 +107,7 @@ def create_server(backend: Backend) -> MCPServer:
         summary = svc.summary()
         if isinstance(backend, WorkspaceRegistry):
             meta = backend.get_workspace(workspace or summary["workspace_id"])
-            return {**meta, "summary": summary, "diagnostics": backend.diagnostics.model_dump()}
+            return {**meta, "summary": summary, "diagnostics": backend.diagnostics}
         return summary
 
     @mcp.tool()

@@ -224,7 +224,11 @@ class DependencyGraph:
                         continue
                     src_col_name = obj.source_column or obj.name
                     matched_sql_field = sql_fields_map.get(src_col_name.casefold())
-                    if matched_sql_field or has_wildcard or part.get("source_type") == "native_sql":
+                    if (
+                        matched_sql_field
+                        or has_wildcard
+                        or part.get("source_type") in {"native_sql", "m_table"}
+                    ):
                         field_label = matched_sql_field or src_col_name
                         sql_field_id = f"{self.ws_id}::sql_field::{t_name}.{field_label}"
                         sql_field_node = self._add_node(

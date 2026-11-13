@@ -142,10 +142,14 @@ class SqlSource:
             "sql_metadata": meta,
         }
         if include_sql:
+            result["sql"] = self.sql_expression
             result["sql_m_expression"] = self.sql_expression
             result["sql_with_line_numbers"] = _add_line_numbers(self.sql_expression)
             result["source_m_expression"] = self.m_expression
         return result
+
+    def to_summary(self, root: Path | None = None) -> dict[str, Any]:
+        return self.as_dict(root=root, include_sql=False)
 
 
 def _unquote_tmdl_name(value: str) -> str:
@@ -283,18 +287,23 @@ def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> 
             if p_name in native_sources:
                 ns = native_sources[p_name]
                 meta = extract_sql_metadata(ns.sql_expression)
+                sql_start_line = text[: ns.sql_start].count("\n") + 1
                 partitions_out.append({
                     "name": p_name,
+                    "partition": p_name,
                     "table": table_name,
                     "partition_type": p_type,
+                    "source_type": "native_sql",
                     "mode": mode,
                     "has_native_sql": True,
                     "source_tables": meta["source_tables"],
                     "sql_fields": meta["selected_fields"],
                     "has_dynamic_parameters": meta["has_dynamic_parameters"],
                     "dynamic_parameters": meta["dynamic_parameters"],
+                    "m_parameters": meta["dynamic_parameters"],
                     "file": rel_file,
                     "line": line_num,
+                    "sql_start_line": sql_start_line,
                 })
             else:
                 # Check standard M Sql.Database / Schema / Item pattern
@@ -309,16 +318,20 @@ def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> 
                     source_tables.append(f"{schema_name}.{item_name}")
                 partitions_out.append({
                     "name": p_name,
+                    "partition": p_name,
                     "table": table_name,
                     "partition_type": p_type,
+                    "source_type": "m_table" if source_tables else p_type,
                     "mode": mode,
                     "has_native_sql": False,
                     "source_tables": source_tables,
                     "sql_fields": [],
                     "has_dynamic_parameters": False,
                     "dynamic_parameters": [],
+                    "m_parameters": [],
                     "file": rel_file,
                     "line": line_num,
+                    "sql_start_line": line_num,
                 })
     return partitions_out
 
