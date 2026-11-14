@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from collections.abc import Callable
+from typing import Annotated, Any, TypeVar, cast
 
 from mcp.server import MCPServer
 from pydantic import Field
 
 from .errors import AmbiguousWorkspaceError, WorkspaceNotFoundError
+from .meta_tools import ToolSpec, build_pbi_help, dispatch_pbi_call, extract_tool_specs
 from .service import PbipService
 from .workspace_registry import WorkspaceRegistry
 
+F = TypeVar("F", bound=Callable[..., Any])
 Backend = PbipService | WorkspaceRegistry
 WorkspaceArg = Annotated[
     str | None,
@@ -38,9 +41,18 @@ OffsetArg = Annotated[
 ]
 
 
-def create_server(backend: Backend) -> MCPServer:
-    """Create the consolidated PBI MCP server with 20 high-leverage tools."""
+def _build_server_and_tools(
+    backend: Backend, *, meta_tools: bool = False
+) -> tuple[MCPServer, dict[str, Callable[..., Any]]]:
+    """Build the consolidated PBI MCP server and its underlying 20-tool map."""
     mcp = MCPServer("pbi-local")
+    tools_map: dict[str, Callable[..., Any]] = {}
+
+    def register_tool(fn: F) -> F:
+        tools_map[fn.__name__] = fn
+        if not meta_tools:
+            mcp.add_tool(fn)
+        return fn
 
     def get_service(workspace: str | None = None) -> PbipService:
         if isinstance(backend, PbipService):
@@ -68,7 +80,7 @@ def create_server(backend: Backend) -> MCPServer:
     # 1. Workspace Discovery & Lifecycle (3 tools)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def list_workspaces(
         query: Annotated[
             str | None,
@@ -100,7 +112,7 @@ def create_server(backend: Backend) -> MCPServer:
             items = items[:limit]
         return items
 
-    @mcp.tool()
+    @register_tool
     def get_workspace(workspace: WorkspaceArg = None) -> dict[str, Any]:
         """Get metadata and object counts for a PBIP workspace."""
         svc = get_service(workspace)
@@ -110,7 +122,7 @@ def create_server(backend: Backend) -> MCPServer:
             return {**meta, "summary": summary, "diagnostics": backend.diagnostics}
         return summary
 
-    @mcp.tool()
+    @register_tool
     def refresh_workspaces() -> list[dict[str, Any]]:
         """Re-scan configured workspace roots and refresh discovered PBIP projects."""
         if isinstance(backend, WorkspaceRegistry):
@@ -121,7 +133,7 @@ def create_server(backend: Backend) -> MCPServer:
     # 2. Semantic Model Inspection & Search (5 tools)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def list_tables(
         workspace: WorkspaceArg = None,
         limit: LimitArg = None,
@@ -130,7 +142,7 @@ def create_server(backend: Backend) -> MCPServer:
         """List all tables in the semantic model with column/measure counts and native SQL status."""
         return get_service(workspace).list_tables(limit=limit, offset=offset)
 
-    @mcp.tool()
+    @register_tool
     def get_table(
         table_name: Annotated[str, Field(description="Table name to inspect.")],
         workspace: WorkspaceArg = None,
@@ -138,7 +150,7 @@ def create_server(backend: Backend) -> MCPServer:
         """Retrieve complete table schema including columns, measures, relationships, and SQL source."""
         return get_service(workspace).get_table(table_name)
 
-    @mcp.tool()
+    @register_tool
     def search_measures(
         query: Annotated[
             str | None,
@@ -157,7 +169,7 @@ def create_server(backend: Backend) -> MCPServer:
             query=query, table=table, limit=limit, offset=offset
         )
 
-    @mcp.tool()
+    @register_tool
     def get_table_sql(
         table_name: Annotated[
             str | None,
@@ -172,7 +184,7 @@ def create_server(backend: Backend) -> MCPServer:
         """Extract the partition SQL query (with line numbers and M context) for a table."""
         return get_service(workspace).get_table_sql(table_name=table_name, partition=partition)
 
-    @mcp.tool()
+    @register_tool
     def analyze_impact(
         term: Annotated[
             str,
@@ -187,7 +199,7 @@ def create_server(backend: Backend) -> MCPServer:
     # 3. Report Layout & Visual Inspection (3 tools)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def list_report_pages(
         workspace: WorkspaceArg = None,
         limit: LimitArg = None,
@@ -196,7 +208,7 @@ def create_server(backend: Backend) -> MCPServer:
         """List all report pages with their display names and visual counts."""
         return get_service(workspace).pages(limit=limit, offset=offset)
 
-    @mcp.tool()
+    @register_tool
     def list_visuals(
         page: Annotated[
             str | None,
@@ -215,7 +227,7 @@ def create_server(backend: Backend) -> MCPServer:
             page=page, query=query, limit=limit, offset=offset
         )
 
-    @mcp.tool()
+    @register_tool
     def get_visual(
         visual_id_or_title: Annotated[
             str,
@@ -234,7 +246,7 @@ def create_server(backend: Backend) -> MCPServer:
     # 4. Safe Mutations - Dry-Run by Default + Auto-Rollback (4 tools)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def update_measure_dax(
         measure_name: Annotated[str, Field(description="Exact measure name to update or create.")],
         expression: Annotated[str, Field(description="Replacement or new DAX expression.")],
@@ -283,7 +295,7 @@ def create_server(backend: Backend) -> MCPServer:
             dry_run=dry_run,
         )
 
-    @mcp.tool()
+    @register_tool
     def update_table_sql(
         old_text: Annotated[str, Field(description="Exact SQL line or block to replace.")],
         new_text: Annotated[str, Field(description="Replacement SQL line or block.")],
@@ -312,7 +324,7 @@ def create_server(backend: Backend) -> MCPServer:
             dry_run=dry_run,
         )
 
-    @mcp.tool()
+    @register_tool
     def update_visual_fields(
         visual_id_or_title: Annotated[
             str,
@@ -352,7 +364,7 @@ def create_server(backend: Backend) -> MCPServer:
             dry_run=dry_run,
         )
 
-    @mcp.tool()
+    @register_tool
     def rename_measure(
         old_name: Annotated[str, Field(description="Existing measure name.")],
         new_name: Annotated[str, Field(description="New measure name.")],
@@ -380,12 +392,12 @@ def create_server(backend: Backend) -> MCPServer:
     # 5. Power BI Analyst Superpowers (4 tools)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def find_unused_objects(workspace: WorkspaceArg = None) -> dict[str, Any]:
         """Scan the semantic model and report layout to identify unused measures and unreferenced columns."""
         return get_service(workspace).find_unused_objects()
 
-    @mcp.tool()
+    @register_tool
     def format_dax(
         measure_name: Annotated[
             str | None,
@@ -410,7 +422,7 @@ def create_server(backend: Backend) -> MCPServer:
             dry_run=dry_run,
         )
 
-    @mcp.tool()
+    @register_tool
     def generate_measure_docs(
         measure_name: Annotated[str, Field(description="Measure name to document in TMDL.")],
         description: Annotated[
@@ -432,7 +444,7 @@ def create_server(backend: Backend) -> MCPServer:
             dry_run=dry_run,
         )
 
-    @mcp.tool()
+    @register_tool
     def check_model_bpa(workspace: WorkspaceArg = None) -> dict[str, Any]:
         """Run Best Practice Analyzer rules against the semantic model (keys, relationships, types, DAX)."""
         return get_service(workspace).check_model_bpa()
@@ -441,7 +453,7 @@ def create_server(backend: Backend) -> MCPServer:
     # 6. Validation (1 tool)
     # -------------------------------------------------------------------------
 
-    @mcp.tool()
+    @register_tool
     def validate_workspace(workspace: WorkspaceArg = None) -> list[dict[str, Any]]:
         """Run structural and syntax validation across TMDL and PBIR report JSON."""
         return get_service(workspace).validation()
@@ -498,4 +510,48 @@ def create_server(backend: Backend) -> MCPServer:
             f"4. Call validate_workspace() to confirm structural integrity and summarize prioritized recommendations."
         )
 
+    if meta_tools:
+        specs = extract_tool_specs(tools_map)
+
+        @mcp.tool()
+        def pbi_call(
+            tool_name: Annotated[
+                str,
+                Field(description="Exact PBI tool name to invoke (e.g. 'get_table', 'search_measures')."),
+            ],
+            arguments: Annotated[
+                dict[str, Any] | None,
+                Field(description="Optional JSON object of keyword arguments for the target PBI tool."),
+            ] = None,
+        ) -> Any:
+            """Execute any PBI_MCP tool by name with an arguments object."""
+            return dispatch_pbi_call(tools_map, specs, tool_name, arguments)
+
+        @mcp.tool()
+        def pbi_help(
+            tool_name: Annotated[
+                str | None,
+                Field(description="Optional exact PBI tool name to inspect full parameter docs and defaults."),
+            ] = None,
+            query: Annotated[
+                str | None,
+                Field(description="Optional keyword to search tool names, descriptions, and parameters."),
+            ] = None,
+        ) -> dict[str, Any]:
+            """Look up full parameter documentation for a PBI tool or search available tools."""
+            return build_pbi_help(specs, tool_name=tool_name, query=query)
+
+    return mcp, tools_map
+
+
+def create_server(backend: Backend, *, meta_tools: bool = False) -> MCPServer:
+    """Create the consolidated PBI MCP server (20 tools, or 2 meta-tools when meta_tools=True)."""
+    mcp, _ = _build_server_and_tools(backend, meta_tools=meta_tools)
     return mcp
+
+
+def get_tool_specs() -> list[ToolSpec]:
+    """Introspect the 20 PBI tool definitions without requiring an active workspace."""
+    _, tools_map = _build_server_and_tools(cast(Backend, None), meta_tools=False)
+    return extract_tool_specs(tools_map)
+

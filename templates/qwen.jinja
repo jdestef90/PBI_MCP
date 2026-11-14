@@ -1,0 +1,92 @@
+{#- PBI_MCP_CATALOG_START -#}
+{%- set _pbi_tools_catalog -%}
+{% raw %}
+## Power BI (PBI_MCP) Tools
+Invoke any tool below via `pbi_call(tool_name, arguments)`. Call `pbi_help(tool_name)` or `pbi_help(query)` for full parameter docs/defaults.
+Note: Mutation tools default to `dry_run=true` (preview ChangePlan); pass `dry_run=false` to apply.
+
+### Workspace
+- list_workspaces(query?: str, limit?: int, offset?: int): List discovered PBIP workspaces, optionally filtered by query.
+- get_workspace(workspace?: str): Get metadata and object counts for a PBIP workspace.
+- refresh_workspaces(): Re-scan configured workspace roots and refresh discovered PBIP projects.
+
+### Semantic Model
+- list_tables(workspace?: str, limit?: int, offset?: int): List all tables in the semantic model with column/measure counts and native SQL status.
+- get_table(table_name: str, workspace?: str): Retrieve complete table schema including columns, measures, relationships, and SQL source.
+- search_measures(query?: str, table?: str, workspace?: str, limit?: int, offset?: int): Find measures across the semantic model and return their table, name, DAX expression, and description.
+- get_table_sql(table_name?: str, partition?: str, workspace?: str): Extract the partition SQL query (with line numbers and M context) for a table.
+- analyze_impact(term: str, workspace?: str): Analyze where a measure or column is referenced across TMDL formulas and report visuals.
+
+### Report Layout
+- list_report_pages(workspace?: str, limit?: int, offset?: int): List all report pages with their display names and visual counts.
+- list_visuals(page?: str, query?: str, workspace?: str, limit?: int, offset?: int): List visuals in the report with their titles, types, and field bindings.
+- get_visual(visual_id_or_title: str, page?: str, workspace?: str): Get a visual's details and current role-grouped field bindings by ID or title.
+
+### Safe Mutations (dry_run=True default)
+- update_measure_dax(measure_name: str, expression: str, table?: str, create_if_missing?: bool, format_string?: str, display_folder?: str, description?: str, expected_current_expression?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Update an existing measure's DAX expression in TMDL (or create a new measure when create_if_missing=True).
+- update_table_sql(old_text: str, new_text: str, table_name?: str, partition?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Surgically replace a line or block inside a table's Value.NativeQuery SQL expression.
+- update_visual_fields(visual_id_or_title: str, add_fields?: list, remove_fields?: list, page?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Add or remove measures and columns on a visual without modifying visual styling or layout.
+- rename_measure(old_name: str, new_name: str, table?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals.
+
+### Analyst & Validation
+- find_unused_objects(workspace?: str): Scan the semantic model and report layout to identify unused measures and unreferenced columns.
+- format_dax(measure_name?: str, dax_expression?: str, table?: str, workspace?: str, dry_run?: bool): Standardize DAX formatting (uppercase functions, clean operator spacing) standalone or in TMDL.
+- generate_measure_docs(measure_name: str, description?: str, table?: str, workspace?: str, dry_run?: bool): Generate and write a /// TMDL documentation docstring for a measure.
+- check_model_bpa(workspace?: str): Run Best Practice Analyzer rules against the semantic model (keys, relationships, types, DAX).
+- validate_workspace(workspace?: str): Run structural and syntax validation across TMDL and PBIR report JSON.
+{% endraw %}
+{%- endset -%}
+{#- PBI_MCP_CATALOG_END -#}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- _pbi_tools_catalog + '\n\n' }}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- '\n' }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- _pbi_tools_catalog + '<|im_end|>\n' }}
+{%- endif %}
+{%- for message in messages %}
+    {%- if (message.role == 'user') or (message.role == 'system' and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+    {%- elif message.role == 'assistant' %}
+        {{- '<|im_start|>' + message.role }}
+        {%- if message.content %}
+            {{- '\n' + message.content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls | default([]) %}
+            {%- if tool_call.function is defined %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {{- '\n<tool_call>\n{"name": "' }}
+            {{- tool_call.name }}
+            {{- '", "arguments": ' }}
+            {{- tool_call.arguments | tojson }}
+            {{- '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == 'tool' %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != 'tool') %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != 'tool') %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
