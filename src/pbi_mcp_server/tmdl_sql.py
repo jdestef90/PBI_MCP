@@ -11,21 +11,36 @@ from .errors import (
     ObjectNotFoundError,
     PreconditionFailedError,
 )
+from .m_codec import (
+    FenceStyle,
+    MSerializationDescriptor,
+    compute_sql_hash,
+    decode_m_sql_expression,
+    encode_sql_to_m,
+    extract_m_sql_target,
+    split_clean_sql_segments,
+)
 
 _PARTITION_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)partition\s+(?P<name>'(?:''|[^'])*'|[^=\r\n]+?)\s*=\s*(?P<ptype>m|calculated)\s*$"
+    r"(?m)^(?P<indent>[ \t]*)partition\s+"
+    r"(?P<name>'(?:''|[^'])*'|[^=\r\n]+?)\s*=\s*(?P<ptype>m|calculated)\s*$"
 )
 _MODE_RE = re.compile(r"(?m)^[ \t]*mode\s*:\s*(?P<mode>[A-Za-z0-9_]+)\s*$")
-_SOURCE_RE = re.compile(r"(?m)^(?P<indent>[ \t]*)source\s*=\s*```[ \t]*\r?\n")
-_SOURCE_UNFENCED_RE = re.compile(r"(?m)^(?P<indent>[ \t]*)source\s*=[ \t]*\r?\n")
+_SOURCE_FENCED_RE = re.compile(r"(?m)^(?P<indent>[ \t]*)source\s*=\s*```[ \t]*\r?\n")
+_SOURCE_UNFENCED_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)source\s*=(?![ \t]*```)[ \t]*(?P<inline>[^\r\n]*)(?:\r?\n|$)"
+)
 _TABLE_RE = re.compile(r"(?m)^table\s+(?P<name>'(?:''|[^'])*'|[^\r\n]+?)\s*$")
-_NATIVE_QUERY = "Value.NativeQuery"
 
 _M_PARAM_RE = re.compile(r'"\s*&\s*([A-Za-z_][A-Za-z0-9_]*)\s*&\s*"')
 _SQL_DB_RE = re.compile(r'Sql\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"')
 _M_ITEM_RE = re.compile(r'Schema\s*=\s*"([^"]+)"\s*,\s*Item\s*=\s*"([^"]+)"')
+_IDENT_PART = (
+    r"(?:\{\{m:(?:(?!\}\}).)+\}\}|`[^`]+`|\"[^\"]+\"|\[[^\]]+\]|[A-Za-z0-9_]+)"
+)
 _SQL_FROM_JOIN_RE = re.compile(
-    r"(?i)\b(?:FROM|JOIN)\s+([A-Za-z0-9_.\"&\{\}\[\]]+)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?"
+    rf"(?i)\b(?:FROM|JOIN)\s+({_IDENT_PART}(?:\.{_IDENT_PART})*)"
+    r"(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?"
 )
 
 
@@ -34,38 +49,42 @@ def _add_line_numbers(text: str) -> str:
 
 
 def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
-    """Extract projected SQL fields, source tables, and dynamic M parameters from a SQL expression."""
+    """Extract projected fields, source tables, and dynamic M parameters from SQL."""
     dynamic_params: list[str] = []
+    if "{{m:" in sql_expression:
+        for kind, val in split_clean_sql_segments(sql_expression):
+            if kind == "expr" and val not in dynamic_params:
+                dynamic_params.append(val)
     for m in _M_PARAM_RE.finditer(sql_expression):
         param = m.group(1)
         if param not in dynamic_params:
             dynamic_params.append(param)
 
-    # Clean M string concatenation and SQL comments for structural analysis
-    cleaned = _M_PARAM_RE.sub(r"__\1__", sql_expression)
+    cleaned = _M_PARAM_RE.sub(lambda m: f"{{{{m:{m.group(1)}}}}}", sql_expression)
     cleaned = cleaned.strip()
     if cleaned.startswith('""') and cleaned.endswith('""'):
         cleaned = cleaned[2:-2]
     elif cleaned.startswith('"') and cleaned.endswith('"'):
         cleaned = cleaned[1:-1]
 
-    # Remove single-line and block SQL comments
     no_comments = re.sub(r"--[^\r\n]*", "", cleaned)
     no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL)
 
-    # Extract source tables in FROM / JOIN clauses
     source_tables: list[str] = []
     for tm in _SQL_FROM_JOIN_RE.finditer(no_comments):
         raw_tbl = tm.group(1).strip().strip('",')
-        if raw_tbl.upper() not in {"(", "SELECT", "LATERAL", "UNNEST"} and raw_tbl not in source_tables:
+        if (
+            raw_tbl.upper() not in {"(", "SELECT", "LATERAL", "UNNEST"}
+            and raw_tbl not in source_tables
+        ):
             source_tables.append(raw_tbl)
 
-    # Extract projected columns from SELECT ... FROM
     selected_fields: list[str] = []
-    select_match = re.search(r"(?is)\bSELECT\b(?:\s+DISTINCT|\s+TOP\s+\d+)?(.*?)\bFROM\b", no_comments)
+    select_match = re.search(
+        r"(?is)\bSELECT\b(?:\s+DISTINCT|\s+TOP\s+\d+)?(.*?)\bFROM\b", no_comments
+    )
     if select_match:
         select_body = select_match.group(1)
-        # Split top-level commas
         items: list[str] = []
         depth = 0
         in_str = False
@@ -94,17 +113,27 @@ def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
         for item in items:
             if not item:
                 continue
-            # Check explicit AS alias
-            as_match = re.search(r"(?i)\bAS\s+(?:\[([^\]]+)\]|\"([^\"]+)\"|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*$", item)
+            as_match = re.search(
+                r"(?i)\bAS\s+(?:\[([^\]]+)\]|\"([^\"]+)\"|'([^']+)'|`([^`]+)`|"
+                r"([A-Za-z_][A-Za-z0-9_]*))\s*$",
+                item,
+            )
             if as_match:
                 alias = next(g for g in as_match.groups() if g is not None)
                 if alias not in selected_fields:
                     selected_fields.append(alias)
                 continue
-            # Otherwise take trailing identifier (e.g. p.SSN -> SSN)
-            ident_match = re.search(r"(?:\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))\s*$", item)
+            ident_match = re.search(
+                r"(?:\[([^\]]+)\]|\"([^\"]+)\"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*))\s*$",
+                item,
+            )
             if ident_match:
-                col_name = ident_match.group(1) or ident_match.group(2)
+                col_name = (
+                    ident_match.group(1)
+                    or ident_match.group(2)
+                    or ident_match.group(3)
+                    or ident_match.group(4)
+                )
                 if col_name and col_name not in selected_fields:
                     selected_fields.append(col_name)
 
@@ -128,24 +157,47 @@ class SqlSource:
     m_expression: str
     sql_expression: str
     mode: str | None = None
+    connector: str = "Value.NativeQuery"
+    clean_sql: str = ""
+    sql_hash: str = ""
+    descriptor: MSerializationDescriptor | None = None
+    dynamic_parameters: tuple[str, ...] = ()
 
     def as_dict(self, root: Path | None = None, include_sql: bool = True) -> dict[str, Any]:
-        file_value = str(self.file.relative_to(root)).replace("\\", "/") if root else str(self.file).replace("\\", "/")
-        meta = extract_sql_metadata(self.sql_expression)
+        if root:
+            file_value = str(self.file.relative_to(root)).replace("\\", "/")
+        else:
+            file_value = str(self.file).replace("\\", "/")
+        clean = self.clean_sql or self.sql_expression
+        meta = extract_sql_metadata(clean)
+        if self.dynamic_parameters:
+            merged_params = list(self.dynamic_parameters)
+            for p in meta["dynamic_parameters"]:
+                if p not in merged_params:
+                    merged_params.append(p)
+            meta["dynamic_parameters"] = merged_params
+            meta["has_dynamic_parameters"] = bool(merged_params)
+        line_count = len(clean.splitlines())
+        sql_hash = self.sql_hash or compute_sql_hash(clean)
         result: dict[str, Any] = {
             "file": file_value,
             "table": self.table,
             "partition": self.partition,
             "mode": self.mode,
+            "connector": self.connector,
+            "line_count": line_count,
+            "sql_hash": sql_hash,
             "source_span": {"start": self.source_start, "end": self.source_end},
             "sql_span": {"start": self.sql_start, "end": self.sql_end},
             "sql_metadata": meta,
         }
         if include_sql:
-            result["sql"] = self.sql_expression
+            result["sql"] = clean
             result["sql_m_expression"] = self.sql_expression
-            result["sql_with_line_numbers"] = _add_line_numbers(self.sql_expression)
+            result["sql_with_line_numbers"] = _add_line_numbers(clean)
             result["source_m_expression"] = self.m_expression
+            if self.descriptor is not None:
+                result["serialization"] = self.descriptor.to_dict()
         return result
 
     def to_summary(self, root: Path | None = None) -> dict[str, Any]:
@@ -166,56 +218,42 @@ def _find_fence_end(text: str, start: int) -> int:
     return start + match.start()
 
 
-def _scan_m_argument_end(text: str, start: int) -> int:
-    """Find the next top-level argument comma in serialized Power Query M."""
-    depth = 0
-    in_string = False
-    i = start
+def _extract_partition_source_block(
+    text: str, part_end: int, limit: int
+) -> tuple[int, int, FenceStyle, str, int] | None:
+    """Return `(source_start, source_end, fence_style, base_indent, header_start)`."""
+    fenced = _SOURCE_FENCED_RE.search(text, part_end, limit)
+    unfenced = _SOURCE_UNFENCED_RE.search(text, part_end, limit)
 
-    while i < len(text):
-        if text.startswith('""', i):
-            in_string = not in_string
-            i += 2
+    if fenced and (not unfenced or fenced.start() <= unfenced.start()):
+        source_start = fenced.end()
+        source_end = _find_fence_end(text, source_start)
+        return source_start, source_end, "fenced", fenced.group("indent"), fenced.start()
+
+    if not unfenced:
+        return None
+
+    base_indent = unfenced.group("indent")
+    base_width = len(base_indent.expandtabs(4))
+    inline = unfenced.group("inline").strip()
+    source_start = unfenced.start("inline") if inline else unfenced.end()
+    last_content_end = unfenced.end("inline") if inline else unfenced.end()
+
+    pos = unfenced.end()
+    while pos < limit:
+        nl = text.find("\n", pos, limit)
+        line_end = limit if nl < 0 else nl + 1
+        raw_line = text[pos:line_end].rstrip("\r\n")
+        if raw_line.strip() == "":
+            pos = line_end
             continue
+        indent_str = raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+        if len(indent_str.expandtabs(4)) <= base_width:
+            break
+        last_content_end = line_end
+        pos = line_end
 
-        char = text[i]
-        if char == '"':
-            in_string = not in_string
-            i += 1
-            continue
-
-        if in_string:
-            i += 1
-            continue
-
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth -= 1
-            if depth < 0:
-                raise ValueError("Unbalanced closing delimiter while parsing Value.NativeQuery.")
-        elif char == "," and depth == 0:
-            return i
-        i += 1
-
-    raise ValueError("Could not locate the next top-level Value.NativeQuery argument.")
-
-
-def _extract_native_query_second_argument(source: str, absolute_start: int) -> tuple[int, int]:
-    marker = source.find(_NATIVE_QUERY)
-    if marker < 0:
-        raise ValueError("The TMDL M source does not contain Value.NativeQuery.")
-    open_paren = source.find("(", marker + len(_NATIVE_QUERY))
-    if open_paren < 0:
-        raise ValueError("Value.NativeQuery has no opening parenthesis.")
-    first_arg_end = _scan_m_argument_end(source, open_paren + 1)
-    second_start = first_arg_end + 1
-    while second_start < len(source) and source[second_start].isspace():
-        second_start += 1
-    second_end = _scan_m_argument_end(source, second_start)
-    while second_end > second_start and source[second_end - 1].isspace():
-        second_end -= 1
-    return absolute_start + second_start, absolute_start + second_end
+    return source_start, last_content_end, "unfenced", base_indent, unfenced.start()
 
 
 def parse_tmdl_sql_sources(path: Path) -> list[SqlSource]:
@@ -226,18 +264,26 @@ def parse_tmdl_sql_sources(path: Path) -> list[SqlSource]:
     results: list[SqlSource] = []
     for index, partition_match in enumerate(partitions):
         limit = partitions[index + 1].start() if index + 1 < len(partitions) else len(text)
-        block_text = text[partition_match.end() : limit]
-        mode_m = _MODE_RE.search(block_text)
+        extracted = _extract_partition_source_block(text, partition_match.end(), limit)
+        if not extracted:
+            continue
+        source_start, source_end, fence_style, base_indent, header_start = extracted
+        meta_block = text[partition_match.end() : header_start] + text[source_end:limit]
+        mode_m = _MODE_RE.search(meta_block)
         mode = mode_m.group("mode") if mode_m else None
-        source_match = _SOURCE_RE.search(text, partition_match.end(), limit)
-        if not source_match:
-            continue
-        source_start = source_match.end()
-        source_end = _find_fence_end(text, source_start)
+
         source = text[source_start:source_end]
-        if _NATIVE_QUERY not in source:
+        target = extract_m_sql_target(source, source_start)
+        if target is None:
             continue
-        sql_start, sql_end = _extract_native_query_second_argument(source, source_start)
+        connector, sql_start, sql_end = target
+        raw_sql_m = text[sql_start:sql_end]
+        clean_sql, descriptor, dyn_params = decode_m_sql_expression(
+            raw_sql_m,
+            connector=connector,
+            fence_style=fence_style,
+            base_tmdl_indent=base_indent,
+        )
         results.append(
             SqlSource(
                 path,
@@ -248,15 +294,22 @@ def parse_tmdl_sql_sources(path: Path) -> list[SqlSource]:
                 sql_start,
                 sql_end,
                 source,
-                text[sql_start:sql_end],
+                raw_sql_m,
                 mode=mode,
+                connector=connector,
+                clean_sql=clean_sql,
+                sql_hash=compute_sql_hash(clean_sql),
+                descriptor=descriptor,
+                dynamic_parameters=tuple(dyn_params),
             )
         )
     return results
 
 
-def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> list[dict[str, Any]]:
-    """Discover all table partitions (both Value.NativeQuery and standard M/Sql.Database partitions)."""
+def discover_partition_metadata(
+    semantic_model_dir: Path | None, root: Path
+) -> list[dict[str, Any]]:
+    """Discover all table partitions (native SQL and standard M/Sql.Database)."""
     if not semantic_model_dir or not semantic_model_dir.exists():
         return []
     tables_dir = semantic_model_dir / "definition" / "tables"
@@ -286,7 +339,7 @@ def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> 
 
             if p_name in native_sources:
                 ns = native_sources[p_name]
-                meta = extract_sql_metadata(ns.sql_expression)
+                meta = extract_sql_metadata(ns.clean_sql or ns.sql_expression)
                 sql_start_line = text[: ns.sql_start].count("\n") + 1
                 partitions_out.append({
                     "name": p_name,
@@ -294,6 +347,7 @@ def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> 
                     "table": table_name,
                     "partition_type": p_type,
                     "source_type": "native_sql",
+                    "connector": ns.connector,
                     "mode": mode,
                     "has_native_sql": True,
                     "source_tables": meta["source_tables"],
@@ -306,7 +360,6 @@ def discover_partition_metadata(semantic_model_dir: Path | None, root: Path) -> 
                     "sql_start_line": sql_start_line,
                 })
             else:
-                # Check standard M Sql.Database / Schema / Item pattern
                 source_tables: list[str] = []
                 db_m = _SQL_DB_RE.search(block)
                 item_m = _M_ITEM_RE.search(block)
@@ -360,14 +413,20 @@ def _select_sources(
             continue
         if partition is not None and source.partition.casefold() != partition.strip().casefold():
             continue
-        if relative_file is not None and source.file.resolve() != (semantic_model_dir / relative_file).resolve():
+        if (
+            relative_file is not None
+            and source.file.resolve() != (semantic_model_dir / relative_file).resolve()
+        ):
             continue
         selected.append(source)
     return selected
 
 
 def list_table_sql_sources(semantic_model_dir: Path) -> list[dict[str, Any]]:
-    return [s.as_dict(semantic_model_dir, include_sql=False) for s in discover_tmdl_sql_sources(semantic_model_dir)]
+    return [
+        s.as_dict(semantic_model_dir, include_sql=False)
+        for s in discover_tmdl_sql_sources(semantic_model_dir)
+    ]
 
 
 def get_table_sql(
@@ -385,13 +444,14 @@ def get_table_sql(
     )
     if not matches:
         raise ObjectNotFoundError(
-            "No Value.NativeQuery SQL source matched the supplied table, partition, or file selector.",
+            "No Partition SQL source matched the supplied table, partition, or file selector.",
             code="OBJECT_NOT_FOUND",
             details={"table": table, "partition": partition, "relative_file": relative_file},
         )
     if len(matches) > 1:
         raise AmbiguousObjectError(
-            "The selector matched multiple SQL sources. Supply an exact table, partition, or relative_file.",
+            "The selector matched multiple SQL sources. "
+            "Supply an exact table, partition, or relative_file.",
             code="AMBIGUOUS_OBJECT",
             details={
                 "candidates": [
@@ -413,10 +473,13 @@ def search_table_sql(
     if not pattern:
         raise InvalidArgumentError("pattern must not be empty.", code="INVALID_ARGUMENT")
     flags = 0 if case_sensitive else re.IGNORECASE
-    compiled = re.compile(pattern if regex else re.escape(pattern), flags | re.MULTILINE | re.DOTALL)
+    compiled = re.compile(
+        pattern if regex else re.escape(pattern), flags | re.MULTILINE | re.DOTALL
+    )
     results = []
     for source in discover_tmdl_sql_sources(semantic_model_dir):
-        matches = list(compiled.finditer(source.sql_expression))
+        target_sql = source.clean_sql or source.sql_expression
+        matches = list(compiled.finditer(target_sql))
         if matches:
             results.append({
                 **source.as_dict(semantic_model_dir, include_sql=False),
@@ -454,28 +517,46 @@ def update_table_sql(
     )
     if not sources:
         raise ObjectNotFoundError(
-            "No Value.NativeQuery SQL source matched the supplied selector.",
+            "No Partition SQL source matched the supplied selector.",
             code="OBJECT_NOT_FOUND",
             details={"table": table, "partition": partition, "relative_file": relative_file},
         )
     changes = []
     total = 0
-    per_file: dict[Path, list[tuple[SqlSource, int]]] = {}
+    per_file: dict[Path, list[tuple[SqlSource, str, str]]] = {}
+    last_updated_clean: str | None = None
+    last_updated_m: str | None = None
     for source in sources:
-        count = source.sql_expression.count(old_text)
+        clean = source.clean_sql or source.sql_expression
+        count = clean.count(old_text)
         if count:
-            total += count
-            per_file.setdefault(source.file, []).append((source, count))
-            changes.append({
-                **source.as_dict(semantic_model_dir, include_sql=False),
-                "replacements": count,
-                "old_text": old_text,
-                "new_text": new_text,
-                "reason": f"replace SQL fragment in partition {source.partition!r}",
-            })
+            updated_clean = clean.replace(old_text, new_text)
+            updated_m = (
+                encode_sql_to_m(updated_clean, source.descriptor)
+                if source.descriptor is not None
+                else updated_clean
+            )
+        else:
+            count = source.sql_expression.count(old_text)
+            if not count:
+                continue
+            updated_m = source.sql_expression.replace(old_text, new_text)
+            updated_clean = updated_m
+        total += count
+        last_updated_clean = updated_clean
+        last_updated_m = updated_m
+        per_file.setdefault(source.file, []).append((source, source.sql_expression, updated_m))
+        changes.append({
+            **source.as_dict(semantic_model_dir, include_sql=False),
+            "replacements": count,
+            "old_text": old_text,
+            "new_text": new_text,
+            "reason": f"replace SQL fragment in partition {source.partition!r}",
+        })
     if expected_replacements is not None and total != expected_replacements:
         raise PreconditionFailedError(
-            f"Expected {expected_replacements} replacements but found {total}; no files were written.",
+            f"Expected {expected_replacements} replacements but found {total}; "
+            "no files were written.",
             code="PRECONDITION_FAILED",
             details={"expected_replacements": expected_replacements, "actual_replacements": total},
         )
@@ -500,24 +581,28 @@ def update_table_sql(
         "warnings": [],
         "rolled_back": False,
     }
+    if len(changes) == 1 and last_updated_clean is not None and last_updated_m is not None:
+        plan["updated_sql"] = last_updated_clean
+        plan["updated_m_sql"] = last_updated_m
     if dry_run:
         return plan
     for path, file_sources in per_file.items():
         raw = path.read_bytes()
         bom = raw.startswith(b"\xef\xbb\xbf")
-        text = raw.decode("utf-8-sig")
-        updated = text
-        for source, count in sorted(file_sources, key=lambda item: item[0].sql_start, reverse=True):
+        raw_text = raw.decode("utf-8-sig")
+        has_crlf = "\r\n" in raw_text
+        updated = raw_text.replace("\r\n", "\n")
+        for source, expected_m, updated_m in sorted(
+            file_sources, key=lambda item: item[0].sql_start, reverse=True
+        ):
             fragment = updated[source.sql_start : source.sql_end]
-            if fragment.count(old_text) != count:
+            if fragment != expected_m:
                 raise RuntimeError(f"SQL source changed before write: {path}")
-            updated = (
-                updated[: source.sql_start]
-                + fragment.replace(old_text, new_text)
-                + updated[source.sql_end :]
-            )
+            updated = updated[: source.sql_start] + updated_m + updated[source.sql_end :]
         if create_backups:
             path.with_suffix(path.suffix + ".bak").write_bytes(raw)
+        if has_crlf:
+            updated = updated.replace("\n", "\r\n")
         payload = updated.encode("utf-8")
         payload = (b"\xef\xbb\xbf" + payload) if bom else payload
         temp = path.with_suffix(path.suffix + ".tmp")
