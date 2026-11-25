@@ -27,6 +27,8 @@ from .engine_b.parser import (
     list_visuals,
     query_json,
     resolve_visual,
+)
+from .engine_b.parser import (
     update_visual_fields as update_vis_fields,
 )
 from .errors import (
@@ -46,7 +48,11 @@ from .mutation import (
 from .tmdl_sql import (
     discover_partition_metadata,
     discover_tmdl_sql_sources,
+)
+from .tmdl_sql import (
     get_table_sql as extract_table_sql,
+)
+from .tmdl_sql import (
     update_table_sql as mutate_table_sql,
 )
 from .workflows import WorkflowOrchestrator, build_workflow_guidance
@@ -83,7 +89,8 @@ class PbipService:
             plan_dict["error_code"] = "ROLLBACK_COMPLETED"
             for err in errors:
                 plan_dict.setdefault("warnings", []).append(
-                    f"Post-write validation failed ({err.code}): {err.message} — changes rolled back."
+                    f"Post-write validation failed ({err.code}): "
+                    f"{err.message} — changes rolled back."
                 )
         else:
             plan_dict["status"] = "applied"
@@ -114,8 +121,20 @@ class PbipService:
                 "calculation_groups": sum(x.kind == "calculation_group" for x in objects),
                 "calculation_items": sum(x.kind == "calculation_item" for x in objects),
                 "roles": sum(x.kind == "role" for x in objects),
-                "pages": len(list_pages(self.info.report_dir, self.info.root, workspace_id=self.info.workspace_id)),
-                "visuals": len(list_visuals(self.info.report_dir, self.info.root, workspace_id=self.info.workspace_id)),
+                "pages": len(
+                    list_pages(
+                        self.info.report_dir,
+                        self.info.root,
+                        workspace_id=self.info.workspace_id,
+                    )
+                ),
+                "visuals": len(
+                    list_visuals(
+                        self.info.report_dir,
+                        self.info.root,
+                        workspace_id=self.info.workspace_id,
+                    )
+                ),
             },
             "health_summary": bpa.get("health_summary"),
         }
@@ -160,7 +179,9 @@ class PbipService:
             meas_count = sum(
                 x.kind == "measure" and (x.table or "").casefold() == tname_cf for x in objects
             )
-            tbl_parts = [p for p in partition_meta if str(p.get("table", "")).casefold() == tname_cf]
+            tbl_parts = [
+                p for p in partition_meta if str(p.get("table", "")).casefold() == tname_cf
+            ]
             result.append({
                 "name": tbl.name,
                 "object_id": tbl.object_id,
@@ -188,13 +209,23 @@ class PbipService:
         if not schema:
             return None
         if self.info.semantic_model_dir:
-            try:
-                sql_info = extract_table_sql(
-                    self.info.semantic_model_dir, table=schema["table"]
-                )
-                schema["sql_source"] = sql_info
-            except (FileNotFoundError, ValueError):
+            summaries = [
+                s.to_summary(self.info.semantic_model_dir)
+                for s in discover_tmdl_sql_sources(self.info.semantic_model_dir)
+                if (s.table or "").casefold() == schema["table"].casefold()
+            ]
+            if not summaries:
                 schema["sql_source"] = None
+            elif len(summaries) == 1:
+                schema["sql_source"] = summaries[0]
+            else:
+                schema["sql_source"] = {
+                    "multiple_partitions": True,
+                    "partition_count": len(summaries),
+                    "partitions": [s["partition"] for s in summaries],
+                    "sql_hashes": {s["partition"]: s["sql_hash"] for s in summaries},
+                    "line_counts": {s["partition"]: s["line_count"] for s in summaries},
+                }
         return schema
 
     def search_measures(
@@ -240,7 +271,7 @@ class PbipService:
         return [m.model_dump() for m in measures]
 
     def resolve_measure(self, measure_name: str, table: str | None = None) -> dict[str, Any]:
-        """Resolve a measure unambiguously by name or qualified `Table[Measure]`, raising structured errors."""
+        """Resolve a measure by name or `Table[Measure]`, raising structured errors."""
         cleaned = measure_name.strip()
         explicit_table = table
         if not explicit_table and "[" in cleaned and cleaned.endswith("]"):
@@ -265,7 +296,12 @@ class PbipService:
                 f"Multiple measures named {cleaned!r}; specify table: "
                 + ", ".join(f"{c.get('table')}[{c['name']}]" for c in candidates),
                 candidates=[
-                    {"name": c["name"], "table": c.get("table"), "file": c.get("file"), "object_id": c.get("object_id")}
+                    {
+                        "name": c["name"],
+                        "table": c.get("table"),
+                        "file": c.get("file"),
+                        "object_id": c.get("object_id"),
+                    }
                     for c in candidates
                 ],
             )
@@ -328,9 +364,10 @@ class PbipService:
             if not dry_run:
                 updated_file_text = target_path.read_text(encoding="utf-8-sig")
             else:
+                raw_before = sql_before.get("sql_m_expression", sql_before["sql"])
                 updated_file_text = original_file_text.replace(
-                    sql_before["sql"],
-                    plan_dict.get("updated_sql", sql_before["sql"]),
+                    raw_before,
+                    plan_dict.get("updated_m_sql", raw_before),
                     1,
                 )
             diff_obj = build_mutation_diff(rel_file, original_file_text, updated_file_text)
@@ -569,7 +606,12 @@ class PbipService:
                 f"Multiple measures named {old_name!r}; specify table: "
                 + ", ".join(f"{m.get('table')}[{m['name']}]" for m in matches),
                 candidates=[
-                    {"name": m["name"], "table": m.get("table"), "file": m.get("file"), "object_id": m.get("object_id")}
+                    {
+                        "name": m["name"],
+                        "table": m.get("table"),
+                        "file": m.get("file"),
+                        "object_id": m.get("object_id"),
+                    }
                     for m in matches
                 ],
             )
@@ -681,7 +723,12 @@ class PbipService:
                 f"Multiple measures named {measure_name!r}; specify table: "
                 + ", ".join(f"{m.get('table')}[{m['name']}]" for m in matches),
                 candidates=[
-                    {"name": m["name"], "table": m.get("table"), "file": m.get("file"), "object_id": m.get("object_id")}
+                    {
+                        "name": m["name"],
+                        "table": m.get("table"),
+                        "file": m.get("file"),
+                        "object_id": m.get("object_id"),
+                    }
                     for m in matches
                 ],
             )
@@ -734,11 +781,14 @@ class PbipService:
         if count == 0 and create_if_missing:
             if not table:
                 raise InvalidArgumentError(
-                    f"table is required when creating new measure {measure_name!r} with create_if_missing=True."
+                    f"table is required when creating new measure {measure_name!r} "
+                    "with create_if_missing=True."
                 )
             for path in tmdl_files(self.info.semantic_model_dir):
                 file_objs = parse_file(path, self.info.root, workspace_id=self.info.workspace_id)
-                if any(o.kind == "table" and o.name.casefold() == table.casefold() for o in file_objs):
+                if any(
+                    o.kind == "table" and o.name.casefold() == table.casefold() for o in file_objs
+                ):
                     original = path.read_text(encoding="utf-8-sig")
                     changed, c_count = create_measure_declaration(
                         original,
@@ -760,7 +810,9 @@ class PbipService:
                     )
                     break
             if count == 0:
-                raise ObjectNotFoundError(f"Table {table!r} was not found to create measure {measure_name!r}.")
+                raise ObjectNotFoundError(
+                    f"Table {table!r} was not found to create measure {measure_name!r}."
+                )
 
         warnings: list[str] = []
         if count != 1:
@@ -864,7 +916,9 @@ class PbipService:
                 "changed": formatted != dax_expression.strip(),
             }
         if not measure_name:
-            raise InvalidArgumentError("Provide measure_name (to format in-place) or dax_expression.")
+            raise InvalidArgumentError(
+                "Provide measure_name (to format in-place) or dax_expression."
+            )
 
         target = self.resolve_measure(measure_name, table=table)
         raw_expr = dax_expression or target.get("expression") or ""
@@ -957,7 +1011,12 @@ class PbipService:
             raise AmbiguousObjectError(
                 f"Multiple {kind} objects named {name!r}; specify table.",
                 candidates=[
-                    {"name": m["name"], "table": m.get("table"), "file": m.get("file"), "object_id": m.get("object_id")}
+                    {
+                        "name": m["name"],
+                        "table": m.get("table"),
+                        "file": m.get("file"),
+                        "object_id": m.get("object_id"),
+                    }
                     for m in matches
                 ],
             )
@@ -1036,7 +1095,8 @@ class PbipService:
         warnings: list[str] = []
         if impact["counts"]["total"] > 1:
             warnings.append(
-                f"Measure has {impact['counts']['total']} textual references; deletion may leave stale dependencies."
+                f"Measure has {impact['counts']['total']} textual references; "
+                "deletion may leave stale dependencies."
             )
         count = 0
         edits: list[PendingFileEdit] = []
