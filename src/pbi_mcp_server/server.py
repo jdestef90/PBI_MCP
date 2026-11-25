@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated, Any, TypeVar, cast
+from typing import Annotated, Any, Literal, TypeVar, cast
 
 from mcp.server import MCPServer
 from pydantic import Field
 
-from .errors import AmbiguousWorkspaceError, WorkspaceNotFoundError
+from .errors import AmbiguousWorkspaceError, InvalidArgumentError, WorkspaceNotFoundError
+from .m_codec import format_get_table_sql_json, format_get_table_sql_text
 from .meta_tools import ToolSpec, build_pbi_help, dispatch_pbi_call, extract_tool_specs
 from .service import PbipService
 from .workspace_registry import WorkspaceRegistry
@@ -17,7 +18,8 @@ WorkspaceArg = Annotated[
     str | None,
     Field(
         description=(
-            "Workspace identifier returned by list_workspaces (prefer workspace_id or unique name). "
+            "Workspace identifier returned by list_workspaces "
+            "(prefer workspace_id or unique name). "
             "Optional when the server is bound to a single workspace."
         )
     ),
@@ -51,7 +53,8 @@ def _build_server_and_tools(
     def register_tool(fn: F) -> F:
         tools_map[fn.__name__] = fn
         if not meta_tools:
-            mcp.add_tool(fn)
+            structured = False if fn.__name__ == "get_table_sql" else None
+            mcp.add_tool(fn, structured_output=structured)
         return fn
 
     def get_service(workspace: str | None = None) -> PbipService:
@@ -103,7 +106,8 @@ def _build_server_and_tools(
             "root": str(backend.info.root),
             "valid": bool(backend.info.semantic_model_dir),
         }
-        if query and query.strip().casefold() not in "\n".join(str(v) for v in item.values()).casefold():
+        haystack = "\n".join(str(v) for v in item.values()).casefold()
+        if query and query.strip().casefold() not in haystack:
             return []
         items = [item]
         if offset > 0:
@@ -139,7 +143,7 @@ def _build_server_and_tools(
         limit: LimitArg = None,
         offset: OffsetArg = 0,
     ) -> list[dict[str, Any]]:
-        """List all tables in the semantic model with column/measure counts and native SQL status."""
+        """List all tables in the semantic model with column/measure counts and native SQL status."""  # noqa: E501
         return get_service(workspace).list_tables(limit=limit, offset=offset)
 
     @register_tool
@@ -147,14 +151,18 @@ def _build_server_and_tools(
         table_name: Annotated[str, Field(description="Table name to inspect.")],
         workspace: WorkspaceArg = None,
     ) -> dict[str, Any] | None:
-        """Retrieve complete table schema including columns, measures, relationships, and SQL source."""
+        """Retrieve complete table schema including columns, measures, relationships, and SQL source."""  # noqa: E501
         return get_service(workspace).get_table(table_name)
 
     @register_tool
     def search_measures(
         query: Annotated[
             str | None,
-            Field(description="Case-insensitive search term matching measure name, DAX, or description."),
+            Field(
+                description=(
+                    "Case-insensitive search term matching measure name, DAX, or description."
+                )
+            ),
         ] = None,
         table: Annotated[
             str | None,
@@ -164,7 +172,7 @@ def _build_server_and_tools(
         limit: LimitArg = None,
         offset: OffsetArg = 0,
     ) -> list[dict[str, Any]]:
-        """Find measures across the semantic model and return their table, name, DAX expression, and description."""
+        """Find measures across the semantic model and return their table, name, DAX expression, and description."""  # noqa: E501
         return get_service(workspace).search_measures(
             query=query, table=table, limit=limit, offset=offset
         )
@@ -173,26 +181,57 @@ def _build_server_and_tools(
     def get_table_sql(
         table_name: Annotated[
             str | None,
-            Field(description="Table name containing a Value.NativeQuery SQL partition."),
+            Field(description="Table name containing a Partition SQL query."),
         ] = None,
         partition: Annotated[
             str | None,
-            Field(description="Optional partition name if the table has multiple SQL partitions."),
+            Field(
+                description="Optional partition name if the table has multiple SQL partitions."
+            ),
         ] = None,
+        format: Annotated[
+            Literal["text", "json"],
+            Field(
+                description=(
+                    "Output format: 'text' (default, unescaped Clean SQL View) or 'json'."
+                )
+            ),
+        ] = "text",
         workspace: WorkspaceArg = None,
-    ) -> dict[str, Any]:
-        """Extract the partition SQL query (with line numbers and M context) for a table."""
-        return get_service(workspace).get_table_sql(table_name=table_name, partition=partition)
+    ) -> str | dict[str, Any]:
+        """Extract Partition SQL (Clean SQL View with line numbers) for a table."""
+        if format is None:
+            fmt = "text"
+        elif isinstance(format, str):
+            fmt = format.strip().lower()
+        else:
+            fmt = ""
+        if fmt not in {"text", "json"}:
+            raise InvalidArgumentError(
+                f"Unsupported format {format!r}; expected 'text' or 'json'.",
+                code="INVALID_ARGUMENT",
+            )
+        data = get_service(workspace).get_table_sql(
+            table_name=table_name, partition=partition
+        )
+        if fmt == "json":
+            return format_get_table_sql_json(data)
+        return format_get_table_sql_text(data)
 
     @register_tool
     def analyze_impact(
         term: Annotated[
             str,
-            Field(description="Measure or column name whose usage across TMDL and visuals should be analyzed."),
+            Field(
+                description=(
+                    "Measure or column name whose usage across TMDL and visuals "
+                    "should be analyzed."
+                )
+            ),
         ],
         workspace: WorkspaceArg = None,
     ) -> dict[str, Any]:
-        """Analyze where a measure or column is referenced across TMDL formulas and report visuals."""
+        """Analyze where a measure or column is referenced across TMDL formulas and report visuals."""  # noqa: E501
         return get_service(workspace).impact(term)
 
     # -------------------------------------------------------------------------
@@ -216,7 +255,11 @@ def _build_server_and_tools(
         ] = None,
         query: Annotated[
             str | None,
-            Field(description="Optional search term matching visual title, visual type, ID, or bound field."),
+            Field(
+                description=(
+                    "Optional search term matching visual title, visual type, ID, or bound field."
+                )
+            ),
         ] = None,
         workspace: WorkspaceArg = None,
         limit: LimitArg = None,
@@ -235,7 +278,11 @@ def _build_server_and_tools(
         ],
         page: Annotated[
             str | None,
-            Field(description="Optional page name or ID to disambiguate visuals with identical titles."),
+            Field(
+                description=(
+                    "Optional page name or ID to disambiguate visuals with identical titles."
+                )
+            ),
         ] = None,
         workspace: WorkspaceArg = None,
     ) -> dict[str, Any] | None:
@@ -252,19 +299,36 @@ def _build_server_and_tools(
         expression: Annotated[str, Field(description="Replacement or new DAX expression.")],
         table: Annotated[
             str | None,
-            Field(description="Table name to disambiguate the measure (required when create_if_missing=True)."),
+            Field(
+                description=(
+                    "Table name to disambiguate the measure (required when create_if_missing=True)."
+                )
+            ),
         ] = None,
         create_if_missing: Annotated[
             bool,
-            Field(description="When true, create a new measure in the specified table if it does not already exist."),
+            Field(
+                description=(
+                    "When true, create a new measure in the specified table "
+                    "if it does not already exist."
+                )
+            ),
         ] = False,
         format_string: Annotated[
             str | None,
-            Field(description="Optional formatString (e.g. '$#,##0.00' or '0.0%') to set on the measure."),
+            Field(
+                description=(
+                    "Optional formatString (e.g. '$#,##0.00' or '0.0%') to set on the measure."
+                )
+            ),
         ] = None,
         display_folder: Annotated[
             str | None,
-            Field(description="Optional displayFolder to organize the measure in the semantic model."),
+            Field(
+                description=(
+                    "Optional displayFolder to organize the measure in the semantic model."
+                )
+            ),
         ] = None,
         description: Annotated[
             str | None,
@@ -272,7 +336,12 @@ def _build_server_and_tools(
         ] = None,
         expected_current_expression: Annotated[
             str | None,
-            Field(description="Optional precondition guard: current DAX expression that must match before write."),
+            Field(
+                description=(
+                    "Optional precondition guard: current DAX expression that must match "
+                    "before write."
+                )
+            ),
         ] = None,
         expected_replacements: Annotated[
             int | None,
@@ -281,7 +350,7 @@ def _build_server_and_tools(
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
-        """Update an existing measure's DAX expression in TMDL (or create a new measure when create_if_missing=True)."""
+        """Update an existing measure's DAX expression in TMDL (or create a new measure when create_if_missing=True)."""  # noqa: E501
         return get_service(workspace).update_dax(
             measure_name,
             expression,
@@ -349,12 +418,14 @@ def _build_server_and_tools(
         ] = None,
         expected_replacements: Annotated[
             int | None,
-            Field(description="Optional guard requiring an exact number of field binding modifications."),
+            Field(
+                description="Optional guard requiring an exact number of field binding modifications."  # noqa: E501
+            ),
         ] = None,
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
-        """Add or remove measures and columns on a visual without modifying visual styling or layout."""
+        """Add or remove measures and columns on a visual without modifying visual styling or layout."""  # noqa: E501
         return get_service(workspace).update_visual_fields(
             visual_id_or_title,
             add_fields=add_fields,
@@ -379,7 +450,7 @@ def _build_server_and_tools(
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
-        """Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals."""
+        """Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals."""  # noqa: E501
         return get_service(workspace).rename_measure(
             old_name,
             new_name,
@@ -394,7 +465,7 @@ def _build_server_and_tools(
 
     @register_tool
     def find_unused_objects(workspace: WorkspaceArg = None) -> dict[str, Any]:
-        """Scan the semantic model and report layout to identify unused measures and unreferenced columns."""
+        """Scan the semantic model and report layout to identify unused measures and unreferenced columns."""  # noqa: E501
         return get_service(workspace).find_unused_objects()
 
     @register_tool
@@ -414,7 +485,7 @@ def _build_server_and_tools(
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
     ) -> dict[str, Any]:
-        """Standardize DAX formatting (uppercase functions, clean operator spacing) standalone or in TMDL."""
+        """Standardize DAX formatting (uppercase functions, clean operator spacing) standalone or in TMDL."""  # noqa: E501
         return get_service(workspace).format_dax(
             measure_name=measure_name,
             dax_expression=dax_expression,
@@ -446,7 +517,7 @@ def _build_server_and_tools(
 
     @register_tool
     def check_model_bpa(workspace: WorkspaceArg = None) -> dict[str, Any]:
-        """Run Best Practice Analyzer rules against the semantic model (keys, relationships, types, DAX)."""
+        """Run Best Practice Analyzer rules against the semantic model (keys, relationships, types, DAX)."""  # noqa: E501
         return get_service(workspace).check_model_bpa()
 
     # -------------------------------------------------------------------------
@@ -490,24 +561,32 @@ def _build_server_and_tools(
         """Guided 5-stage prompt for safely updating or creating a DAX measure."""
         ws_clause = f" in workspace {workspace!r}" if workspace else ""
         return (
-            f"Execute the 'measure_lookup_and_update' workflow for measure {measure_name!r}{ws_clause}:\n"
-            f"1. Call search_measures(query={measure_name!r}) to resolve the exact measure, table, and current DAX.\n"
-            f"2. Call analyze_impact(term={measure_name!r}) to inspect upstream columns and downstream visuals.\n"
-            f"3. Call update_measure_dax(measure_name={measure_name!r}, expression={new_dax!r}, dry_run=True) and review the unified diff.\n"
-            f"4. Call update_measure_dax(measure_name={measure_name!r}, expression={new_dax!r}, dry_run=False) with expected_current_expression.\n"
-            f"5. Verify post-write validation status."
+            f"Execute the 'measure_lookup_and_update' workflow for measure "
+            f"{measure_name!r}{ws_clause}:\n"
+            f"1. Call search_measures(query={measure_name!r}) to resolve the exact measure, "
+            "table, and current DAX.\n"
+            f"2. Call analyze_impact(term={measure_name!r}) to inspect upstream columns "
+            "and downstream visuals.\n"
+            f"3. Call update_measure_dax(measure_name={measure_name!r}, "
+            f"expression={new_dax!r}, dry_run=True) and review the unified diff.\n"
+            f"4. Call update_measure_dax(measure_name={measure_name!r}, "
+            f"expression={new_dax!r}, dry_run=False) with expected_current_expression.\n"
+            "5. Verify post-write validation status."
         )
 
     @mcp.prompt()
     def workflow_model_audit(workspace: str = "") -> str:
-        """Guided prompt for running a comprehensive Power BI Semantic Model & Report Layout audit."""
+        """Guided prompt for running a comprehensive Power BI Semantic Model & Report Layout audit."""  # noqa: E501
         ws_clause = f" for workspace {workspace!r}" if workspace else ""
         return (
             f"Run a comprehensive Power BI model and report audit{ws_clause}:\n"
-            f"1. Call get_workspace() to inspect object counts and overall health_summary.\n"
-            f"2. Call check_model_bpa() to identify relationship, DAX, performance, and report visual binding issues.\n"
-            f"3. Call find_unused_objects() to list unused measures, unused columns, and dead-branch objects.\n"
-            f"4. Call validate_workspace() to confirm structural integrity and summarize prioritized recommendations."
+            "1. Call get_workspace() to inspect object counts and overall health_summary.\n"
+            "2. Call check_model_bpa() to identify relationship, DAX, performance, "
+            "and report visual binding issues.\n"
+            "3. Call find_unused_objects() to list unused measures, unused columns, "
+            "and dead-branch objects.\n"
+            "4. Call validate_workspace() to confirm structural integrity and summarize "
+            "prioritized recommendations."
         )
 
     if meta_tools:
@@ -517,11 +596,19 @@ def _build_server_and_tools(
         def pbi_call(
             tool_name: Annotated[
                 str,
-                Field(description="Exact PBI tool name to invoke (e.g. 'get_table', 'search_measures')."),
+                Field(
+                    description=(
+                        "Exact PBI tool name to invoke (e.g. 'get_table', 'search_measures')."
+                    )
+                ),
             ],
             arguments: Annotated[
                 dict[str, Any] | None,
-                Field(description="Optional JSON object of keyword arguments for the target PBI tool."),
+                Field(
+                    description=(
+                        "Optional JSON object of keyword arguments for the target PBI tool."
+                    )
+                ),
             ] = None,
         ) -> Any:
             """Execute any PBI_MCP tool by name with an arguments object."""
@@ -531,11 +618,19 @@ def _build_server_and_tools(
         def pbi_help(
             tool_name: Annotated[
                 str | None,
-                Field(description="Optional exact PBI tool name to inspect full parameter docs and defaults."),
+                Field(
+                    description=(
+                        "Optional exact PBI tool name to inspect full parameter docs and defaults."
+                    )
+                ),
             ] = None,
             query: Annotated[
                 str | None,
-                Field(description="Optional keyword to search tool names, descriptions, and parameters."),
+                Field(
+                    description=(
+                        "Optional keyword to search tool names, descriptions, and parameters."
+                    )
+                ),
             ] = None,
         ) -> dict[str, Any]:
             """Look up full parameter documentation for a PBI tool or search available tools."""

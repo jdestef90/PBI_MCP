@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import UnionType
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
 from pydantic.fields import FieldInfo
 
@@ -54,7 +54,7 @@ class ToolSpec:
     params: list[ParamSpec]
 
     def compact_signature(self) -> str:
-        """Render a concise one-line signature like `get_table(table_name: str, workspace?: str)`."""
+        """Render a concise one-line tool signature."""
         parts: list[str] = []
         for p in self.params:
             suffix = "" if p.required else "?"
@@ -68,6 +68,8 @@ def _format_type(annotation: Any) -> str:
         return "any"
     origin = get_origin(annotation)
     if origin is not None:
+        if origin is Literal:
+            return "|".join(repr(a) for a in get_args(annotation))
         args = [a for a in get_args(annotation) if a is not type(None)]
         if origin in (Union, UnionType):
             if len(args) == 1:
@@ -144,7 +146,10 @@ def format_compact_catalog(specs: list[ToolSpec]) -> str:
             "Invoke any tool below via `pbi_call(tool_name, arguments)`. "
             "Call `pbi_help(tool_name)` or `pbi_help(query)` for full parameter docs/defaults."
         ),
-        "Note: Mutation tools default to `dry_run=true` (preview ChangePlan); pass `dry_run=false` to apply.",
+        (
+            "Note: Mutation tools default to `dry_run=true` (preview ChangePlan); "
+            "pass `dry_run=false` to apply."
+        ),
     ]
 
     for category, names in _TOOL_CATEGORIES:
