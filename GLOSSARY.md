@@ -45,5 +45,17 @@ A dynamic calculation defined in TMDL associated with a table.
 _Avoid_: Metric formula, calculated field
 
 **Partition SQL**:
-The source SQL query embedded within a table's TMDL partition M-expression (e.g., `Value.NativeQuery` or `Sql.Database`).
+The source SQL query embedded within a table's TMDL partition M-expression (e.g., `Value.NativeQuery`, `Databricks.Query`, or `Sql.Database`).
 _Avoid_: DirectQuery script, source query
+
+**Clean SQL View**:
+The M-decoded, line-numbered representation of a table's Partition SQL that serves as the canonical coordinate system for inspection and editing.
+_Avoid_: Raw M string, pretty-printed SQL
+
+**SQL Section**:
+A named, addressable region of Partition SQL — either a top-level CTE or `main` (the final `SELECT` query) — anchored to its canonical line range in the Clean SQL View.
+_Avoid_: Query chunk, SQL block
+
+**Dynamic M Parameter**:
+A Power Query M variable or expression interpolated into Partition SQL (such as a catalog, schema, or date-range parameter) that must be preserved across edits.
+_Avoid_: Query macro, SQL variable, template tag
