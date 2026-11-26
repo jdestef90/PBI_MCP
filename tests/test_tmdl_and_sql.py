@@ -90,7 +90,7 @@ def test_lists_and_extracts_full_dynamic_native_query_sql(tmp_path: Path) -> Non
     res = get_table_sql(model, table="Basic Work TB")
     value = res["sql_m_expression"]
     assert "CONCAT('***-**-', RIGHT(p.SSN,4)) AS SSN" in value
-    assert "1: " in res["sql_with_line_numbers"]
+    assert "1 | " in res["sql_with_line_numbers"]
     assert "null, [EnableFolding=true]" not in value
     assert "column SSN" not in value
 

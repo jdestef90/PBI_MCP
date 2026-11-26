@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import re
+
+# SQL keywords that look like table names in FROM/JOIN clauses but aren't
+_SQL_KEYWORDS = frozenset({
+    "SELECT", "LATERAL", "UNNEST", "WHERE", "GROUP", "ORDER",
+    "HAVING", "ON", "CROSS", "INNER", "LEFT", "RIGHT",
+    "FULL", "OUTER", "NATURAL", "USING", "VALUES",
+})
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,11 +53,21 @@ _SQL_FROM_JOIN_RE = re.compile(
 
 
 def _add_line_numbers(text: str) -> str:
-    return "\n".join(f"{idx}: {line}" for idx, line in enumerate(text.splitlines(), 1))
+    """Format SQL with right-aligned canonical 1-based line numbers (``42 | ...``)."""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    width = len(str(len(lines)))
+    return "\n".join(f"{idx:>{width}} | {line}" for idx, line in enumerate(lines, 1))
 
 
 def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
-    """Extract projected fields, source tables, and dynamic M parameters from SQL."""
+    """Extract projected fields, source tables, and dynamic M parameters from SQL.
+
+    For CTE-based queries, reads selected_fields from the ``main`` section (the
+    final SELECT) rather than the first CTE.  Internal CTE names are excluded
+    from ``source_tables``.
+    """
     dynamic_params: list[str] = []
     if "{{m:" in sql_expression:
         for kind, val in split_clean_sql_segments(sql_expression):
@@ -70,18 +88,46 @@ def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
     no_comments = re.sub(r"--[^\r\n]*", "", cleaned)
     no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL)
 
-    source_tables: list[str] = []
-    for tm in _SQL_FROM_JOIN_RE.finditer(no_comments):
-        raw_tbl = tm.group(1).strip().strip('",')
-        if (
-            raw_tbl.upper() not in {"(", "SELECT", "LATERAL", "UNNEST"}
-            and raw_tbl not in source_tables
-        ):
-            source_tables.append(raw_tbl)
+    # Scan for SQL Sections to identify main section and internal CTE names
+    sections = scan_sql_sections(cleaned)
+    cte_names: set[str] = set()
+    main_section: SqlSection | None = None
+    for s in sections:
+        if s.name != "main":
+            cte_names.add(s.name)
+        else:
+            main_section = s
 
+    # Extract source tables from ALL sections (CTEs + main), excluding internal CTE names
+    source_tables: list[str] = []
+    for sec in sections:
+        if sec.start_offset > 0:
+            sec_text = cleaned[sec.start_offset:]
+        else:
+            sec_lines = cleaned.splitlines()
+            sec_text = "\n".join(sec_lines[sec.start_line - 1:sec.end_line])
+        for tm in _SQL_FROM_JOIN_RE.finditer(sec_text):
+            raw_tbl = tm.group(1).strip().strip('",')
+            if (
+                raw_tbl.upper() not in {"(", "SELECT", "LATERAL", "UNNEST"}
+                and raw_tbl not in source_tables
+                and raw_tbl not in cte_names
+            ):
+                source_tables.append(raw_tbl)
+
+    # Extract selected_fields from main section (or first SELECT if no sections)
     selected_fields: list[str] = []
+    if main_section:
+        if main_section.start_offset > 0:
+            select_body_text = cleaned[main_section.start_offset:]
+        else:
+            main_lines = cleaned.splitlines()
+            select_body_text = "\n".join(main_lines[main_section.start_line - 1:main_section.end_line])
+    else:
+        select_body_text = no_comments
+
     select_match = re.search(
-        r"(?is)\bSELECT\b(?:\s+DISTINCT|\s+TOP\s+\d+)?(.*?)\bFROM\b", no_comments
+        r"(?is)\bSELECT\b(?:\s+DISTINCT|\s+TOP\s+\d+)?(.*?)\bFROM\b", select_body_text
     )
     if select_match:
         select_body = select_match.group(1)
@@ -179,6 +225,13 @@ class SqlSource:
             meta["has_dynamic_parameters"] = bool(merged_params)
         line_count = len(clean.splitlines())
         sql_hash = self.sql_hash or compute_sql_hash(clean)
+
+        # Add SQL section names to metadata
+        sections = scan_sql_sections(clean)
+        section_names = [s.name for s in sections]
+        meta["sql_section_names"] = section_names
+        meta["sql_section_count"] = len(section_names)
+
         result: dict[str, Any] = {
             "file": file_value,
             "table": self.table,
@@ -435,7 +488,18 @@ def get_table_sql(
     table: str | None = None,
     partition: str | None = None,
     relative_file: str | None = None,
+    ctes: str | list[str] | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    outline: bool = False,
 ) -> dict[str, Any]:
+    """Get Partition SQL for a table with outline-first progressive disclosure.
+
+    For queries > 120 lines without selectors, returns an outline of SQL Sections.
+    The ``ctes`` parameter fetches specific CTEs/main sections.
+    ``start_line``/``end_line`` returns a line-range slice.
+    ``outline=True`` forces outline mode for any query size.
+    """
     matches = _select_sources(
         semantic_model_dir,
         table=table,
@@ -460,7 +524,141 @@ def get_table_sql(
                 ]
             },
         )
-    return matches[0].as_dict(semantic_model_dir, include_sql=True)
+    source = matches[0]
+    clean_sql = source.clean_sql or source.sql_expression
+    total_lines = len(clean_sql.splitlines())
+
+    # Determine if we should return outline
+    has_selector = ctes is not None or start_line is not None or end_line is not None
+    if outline or (total_lines > 120 and not has_selector):
+        # Return outline view
+        sections = scan_sql_sections(clean_sql)
+        section_names = [s.name for s in sections]
+        result = source.as_dict(semantic_model_dir, include_sql=False)
+        result["sql_sections"] = [
+            {
+                "name": s.name,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+                "line_count": s.end_line - s.start_line + 1,
+                "references": list(s.references),
+                "external_tables": list(s.external_tables),
+            }
+            for s in sections
+        ]
+        result["outline"] = True
+        result["total_lines"] = total_lines
+        # Add next-call hints
+        if sections:
+            cte_names = [s.name for s in sections if s.name != "main"]
+            if cte_names:
+                result["next_call_hints"] = (
+                    f"Fetch a specific CTE: ctes={cte_names[0]!r} "
+                    f"or ctes={cte_names!r}"
+                )
+            else:
+                result["next_call_hints"] = (
+                    f"Fetch lines: start_line=1 or start_line=N"
+                )
+        return result
+
+    # Handle ctes selector
+    if ctes is not None:
+        if isinstance(ctes, str):
+            ctes = [ctes]
+        sections = scan_sql_sections(clean_sql)
+        section_map: dict[str, SqlSection] = {}
+        for s in sections:
+            section_map[s.name.casefold()] = s
+        requested: list[SqlSection] = []
+        for c in ctes:
+            cf = c.casefold()
+            if cf not in section_map:
+                valid_names = [s.name for s in sections]
+                raise ObjectNotFoundError(
+                    f"Unknown SQL Section {c!r}. Valid sections: {valid_names}",
+                    code="OBJECT_NOT_FOUND",
+                    details={"requested_cte": c, "valid_sections": valid_names},
+                )
+            requested.append(section_map[cf])
+
+        # Build SQL for requested sections
+        requested_sql_parts: list[str] = []
+        for i, sec in enumerate(requested):
+            sec_lines = clean_sql.splitlines()
+            section_text = "\n".join(
+                f"{ln:>{len(str(sec.end_line))}} | {sec_lines[ln - 1]}"
+                for ln in range(sec.start_line, sec.end_line + 1)
+            )
+            requested_sql_parts.append(section_text)
+        requested_sql = "\n\n---\n\n".join(requested_sql_parts)
+
+        result = source.as_dict(semantic_model_dir, include_sql=False)
+        result["sql"] = requested_sql
+        result["sql_with_line_numbers"] = requested_sql
+        result["requested_ctes"] = ctes
+        result["outline"] = False
+        result["total_lines"] = total_lines
+
+        # Check 400-line safety ceiling
+        if len(requested_sql.splitlines()) > 400:
+            result["warnings"] = [
+                f"Requested sections exceed 400 lines. "
+                f"Use start_line/end_line to fetch remaining lines."
+            ]
+        return result
+
+    # Handle start_line/end_line selector
+    if start_line is not None or end_line is not None:
+        all_lines = clean_sql.splitlines()
+        total = len(all_lines)
+
+        if start_line is None:
+            start_line = 1
+        if end_line is None:
+            end_line = min(start_line + 119, total)
+
+        if start_line < 1 or end_line < 1:
+            raise InvalidArgumentError(
+                "start_line and end_line must be >= 1.",
+                code="INVALID_ARGUMENT",
+            )
+        if start_line > end_line:
+            raise InvalidArgumentError(
+                f"start_line ({start_line}) exceeds end_line ({end_line}).",
+                code="INVALID_ARGUMENT",
+            )
+        if start_line > total:
+            raise InvalidArgumentError(
+                f"start_line ({start_line}) exceeds total lines ({total}).",
+                code="INVALID_ARGUMENT",
+            )
+        if end_line > total:
+            end_line = total
+
+        sliced = all_lines[start_line - 1:end_line]
+        width = len(str(end_line))
+        numbered = "\n".join(
+            f"{ln:>{width}} | {line}" for ln, line in enumerate(sliced, start_line)
+        )
+
+        result = source.as_dict(semantic_model_dir, include_sql=False)
+        result["sql"] = numbered
+        result["sql_with_line_numbers"] = numbered
+        result["start_line"] = start_line
+        result["end_line"] = end_line
+        result["outline"] = False
+        result["total_lines"] = total
+
+        if end_line < total:
+            result["next_call_hints"] = (
+                f"Continue from line {end_line + 1}: "
+                f"start_line={end_line + 1}"
+            )
+        return result
+
+    # Default: return full SQL for small queries (<= 120 lines)
+    return source.as_dict(semantic_model_dir, include_sql=True)
 
 
 def search_table_sql(
@@ -609,3 +807,392 @@ def update_table_sql(
         temp.write_bytes(payload)
         temp.replace(path)
     return plan
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL Section scanner (Issue #3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SqlSection:
+    """A named SQL Section: either a top-level CTE or the final `main` SELECT."""
+
+    name: str
+    start_line: int
+    end_line: int
+    references: tuple[str, ...] = ()
+    external_tables: tuple[str, ...] = ()
+    start_offset: int = 0  # Character offset in cleaned SQL (for precise extraction)
+
+
+def _strip_comments(text: str) -> str:
+    """Replace SQL comments with spaces (preserving line count and positions)."""
+    result: list[str] = []
+    i = 0
+    length = len(text)
+    in_single_quote = False
+    in_double_quote = False
+    in_backtick = False
+    while i < length:
+        ch = text[i]
+        # Track string context
+        if ch == "'" and not in_double_quote and not in_backtick:
+            in_single_quote = not in_single_quote
+            result.append(ch)
+            i += 1
+        elif ch == '"' and not in_single_quote and not in_backtick:
+            in_double_quote = not in_double_quote
+            result.append(ch)
+            i += 1
+        elif ch == '`' and not in_single_quote and not in_double_quote:
+            in_backtick = not in_backtick
+            result.append(ch)
+            i += 1
+        elif not in_single_quote and not in_double_quote and not in_backtick:
+            # Block comment
+            if ch == '/' and i + 1 < length and text[i + 1] == '*':
+                end = text.find('*/', i + 2)
+                if end == -1:
+                    end = length
+                result.append(' ' * (end - i))
+                i = end + 2
+            # Line comment
+            elif ch == '-' and i + 1 < length and text[i + 1] == '-':
+                end = text.find('\n', i)
+                if end == -1:
+                    end = length
+                result.append(' ' * (end - i))
+                i = end
+            else:
+                result.append(ch)
+                i += 1
+        else:
+            result.append(ch)
+            i += 1
+    return ''.join(result)
+
+
+def _find_matching_paren(text: str, start: int) -> int:
+    """Find the matching closing parenthesis for the one at position `start`."""
+    depth = 0
+    i = start
+    length = len(text)
+    in_single_quote = False
+    in_double_quote = False
+    in_backtick = False
+    while i < length:
+        ch = text[i]
+        if ch == "'" and not in_double_quote and not in_backtick:
+            in_single_quote = not in_single_quote
+        elif ch == '"' and not in_single_quote and not in_backtick:
+            in_double_quote = not in_double_quote
+        elif ch == '`' and not in_single_quote and not in_double_quote:
+            in_backtick = not in_backtick
+        elif not in_single_quote and not in_double_quote and not in_backtick:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return length - 1
+
+
+def _extract_cte_name(text: str, pos: int) -> str | None:
+    """Extract a CTE name starting at position `pos`."""
+    length = len(text)
+    # Skip whitespace
+    while pos < length and text[pos] in ' \t':
+        pos += 1
+    if pos >= length:
+        return None
+
+    # Check for backtick-quoted identifier
+    if text[pos] == '`':
+        end = text.find('`', pos + 1)
+        if end == -1:
+            return None
+        return text[pos:end + 1]
+
+    # Check for double-quoted identifier
+    if text[pos] == '"':
+        end = text.find('"', pos + 1)
+        if end == -1:
+            return None
+        return text[pos:end + 1]
+
+    # Plain identifier
+    start = pos
+    while pos < length and (text[pos].isalnum() or text[pos] == '_'):
+        pos += 1
+    if pos == start:
+        return None
+    return text[start:pos]
+
+
+def _scan_ctes(clean_sql: str, lines: list[str]) -> list[SqlSection]:
+    """Scan top-level WITH ... CTEs and return ordered section descriptors."""
+    stripped = _strip_comments(clean_sql)
+    upper = stripped.upper()
+
+    # Check if this is a WITH query
+    with_match = re.search(r'\bWITH\s+(RECURSIVE\s+)?', upper)
+    if not with_match:
+        return []
+
+    with_start = with_match.start()
+    pos = with_match.end()
+
+    sections: list[SqlSection] = []
+    cte_names: set[str] = set()
+
+    while True:
+        # Skip whitespace
+        while pos < len(stripped) and stripped[pos] in ' \t\n\r':
+            pos += 1
+
+        if pos >= len(stripped):
+            break
+
+        # Extract CTE name
+        cte_name = _extract_cte_name(stripped, pos)
+        if cte_name is None:
+            break
+
+        # Check for "AS (" after the name
+        after_name = stripped[pos + len(cte_name):]
+        as_match = re.match(r'\s*AS\s*\(', after_name, re.IGNORECASE)
+        if not as_match:
+            break
+
+        # Find the opening paren of the CTE body
+        paren_start = pos + len(cte_name) + as_match.start() + 2  # skip "AS ("
+        paren_end = _find_matching_paren(stripped, paren_start)
+
+        # Compute line numbers (1-based)
+        cte_start_offset = pos
+        cte_end_offset = paren_end + 1  # inclusive
+
+        cte_start_line = stripped[:cte_start_offset].count('\n') + 1
+        cte_end_line = stripped[:cte_end_offset].count('\n') + 1
+
+        # Extract body for reference/table scanning
+        cte_body = stripped[paren_start + 1:paren_end]
+
+        # Find references to other CTEs and external tables in this CTE
+        refs: set[str] = set()
+        ext_tables: set[str] = set()
+
+        # Look for FROM/JOIN references
+        for tm in re.finditer(
+            r'\b(?:FROM|JOIN)\s+(`[^`]+`|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)',
+            cte_body,
+            re.IGNORECASE,
+        ):
+            ref = tm.group(1).strip('`,')
+            ref_upper = ref.upper()
+            if ref_upper in _SQL_KEYWORDS:
+                continue
+            if ref in cte_names and ref != cte_name:
+                refs.add(ref)
+            elif ref not in cte_names:
+                ext_tables.add(ref)
+
+        sections.append(SqlSection(
+            name=cte_name,
+            start_line=cte_start_line,
+            end_line=cte_end_line,
+            references=tuple(sorted(refs)),
+            external_tables=tuple(sorted(ext_tables)),
+        ))
+        cte_names.add(cte_name)
+
+        # Move past the CTE body closing paren
+        pos = paren_end + 1
+
+        # Skip whitespace and optional comma
+        while pos < len(stripped) and stripped[pos] in ' \t\n\r':
+            pos += 1
+        if pos < len(stripped) and stripped[pos] == ',':
+            pos += 1
+            while pos < len(stripped) and stripped[pos] in ' \t\n\r':
+                pos += 1
+
+        # If we hit a non-comma, non-whitespace that's not a valid identifier start, stop
+        if pos < len(stripped) and not (stripped[pos].isalpha() or stripped[pos] == '_' or stripped[pos] in ('"', '`')):
+            break
+
+    return sections
+
+
+def _scan_main_section(clean_sql: str, lines: list[str], cte_sections: list[SqlSection]) -> SqlSection:
+    """Find the main (trailing SELECT) section after all CTEs."""
+    stripped = _strip_comments(clean_sql)
+
+    if cte_sections:
+        # Find the character position after the last CTE
+        last_cte = cte_sections[-1]
+        # We need to find where the last CTE actually ends in the text
+        # by counting newlines up to end_line, then finding the closing paren
+        line_count = 0
+        pos_after_last_cte = 0
+        for i, line in enumerate(lines):
+            line_count += len(line) + 1  # +1 for newline
+            if i + 1 >= last_cte.end_line:
+                pos_after_last_cte = line_count
+                break
+        
+        # If we're still on the same line as the CTE end, find the actual end
+        # by looking for the closing paren of the CTE
+        if last_cte.start_line == last_cte.end_line:
+            # Single-line CTE: find the closing paren
+            cte_start = stripped[:last_cte.start_line - 1].count('\n')
+            # Find the AS ( and then the matching )
+            as_idx = stripped[cte_start:].upper().find(' AS (')
+            if as_idx >= 0:
+                paren_start = cte_start + as_idx + 4
+                paren_end = _find_matching_paren(stripped, paren_start)
+                pos_after_last_cte = paren_end + 1
+        
+        main_text = stripped[pos_after_last_cte:]
+    else:
+        main_text = stripped
+
+    # Find the main SELECT
+    main_select_match = re.search(r'\bSELECT\b', main_text, re.IGNORECASE)
+    if not main_select_match:
+        main_select_match = re.search(r'\bUNION\b', main_text, re.IGNORECASE)
+
+    if main_select_match:
+        if cte_sections:
+            main_start_offset = pos_after_last_cte + main_select_match.start()
+        else:
+            main_start_offset = main_select_match.start()
+        main_start_line = stripped[:main_start_offset].count('\n') + 1
+        main_end_line = stripped.count('\n') + 1
+    else:
+        main_start_line = 1
+        main_end_line = len(lines)
+        main_text = stripped
+
+    # Build a case-insensitive lookup of CTE names
+    cte_names_lower: dict[str, str] = {}
+    for s in cte_sections:
+        cte_names_lower[s.name.casefold()] = s.name
+
+    # Extract references and external tables from main section
+    refs: set[str] = set()
+    ext_tables: set[str] = set()
+    for tm in re.finditer(
+        r'\b(?:FROM|JOIN)\s+(`[^`]+`|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)',
+        main_text,
+        re.IGNORECASE,
+    ):
+        ref = tm.group(1).strip('`,')
+        ref_upper = ref.upper()
+        if ref_upper in _SQL_KEYWORDS:
+            continue
+        if ref.casefold() in cte_names_lower:
+            refs.add(cte_names_lower[ref.casefold()])
+        else:
+            ext_tables.add(ref)
+
+    return SqlSection(
+        name='main',
+        start_line=main_start_line,
+        end_line=main_end_line,
+        references=tuple(sorted(refs)),
+        external_tables=tuple(sorted(ext_tables)),
+        start_offset=main_start_offset if cte_sections else 0,
+    )
+
+
+def _scan_clause_landmarks(clean_sql: str, lines: list[str]) -> list[SqlSection]:
+    """Scan non-CTE queries for top-level clause landmarks."""
+    stripped = _strip_comments(clean_sql)
+    upper = stripped.upper()
+    sections: list[SqlSection] = []
+
+    # Find top-level clause positions
+    clause_patterns = [
+        ('SELECT', r'\bSELECT\b'),
+        ('FROM', r'\bFROM\b'),
+        ('JOIN', r'\bJOIN\b'),
+        ('WHERE', r'\bWHERE\b'),
+        ('GROUP BY', r'\bGROUP\s+BY\b'),
+        ('HAVING', r'\bHAVING\b'),
+        ('QUALIFY', r'\bQUALIFY\b'),
+        ('ORDER BY', r'\bORDER\s+BY\b'),
+        ('UNION', r'\bUNION\b'),
+    ]
+
+    found: list[tuple[str, int, int]] = []
+    for clause_name, pattern in clause_patterns:
+        for m in re.finditer(pattern, upper):
+            # Make sure this isn't inside a string
+            start = m.start()
+            # Check it's not preceded by SELECT/FROM/WHERE/JOIN etc. that would make it part of another clause
+            before = upper[max(0, start - 20):start]
+            if re.search(r'\b(SELECT|FROM|WHERE|GROUP|HAVING|ORDER|UNION)\b', before):
+                continue
+            line_num = stripped[:start].count('\n') + 1
+            found.append((clause_name, line_num, m.end(), start))
+
+    if not found:
+        # Default: the whole query is one section
+        return [SqlSection(name='main', start_line=1, end_line=len(lines))]
+
+    # Sort by line number
+    found.sort(key=lambda x: x[1])
+
+    # Build sections
+    for i, (name, start_line, end_pos, clause_start) in enumerate(found):
+        # End is the start of the next clause, or end of file
+        if i + 1 < len(found):
+            next_line = found[i + 1][1]
+            end_line = next_line - 1
+        else:
+            end_line = len(lines)
+
+        # Extract external tables for FROM/JOIN clauses
+        ext_tables: set[str] = set()
+        if name in ('FROM', 'JOIN'):
+            # Scan from this clause's start position up to the next clause
+            clause_end_pos = stripped[:found[i + 1][1] - 1].count('\n') + found[i + 1][1] if i + 1 < len(found) else len(stripped)
+            clause_text = stripped[clause_start:clause_end_pos]
+            for tm in re.finditer(
+                r'\b(?:FROM|JOIN)\s+(`[^`]+`|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)',
+                clause_text,
+                re.IGNORECASE,
+            ):
+                ref = tm.group(1).strip('`,')
+                ref_upper = ref.upper()
+                if ref_upper not in _SQL_KEYWORDS:
+                    ext_tables.add(ref)
+
+        sections.append(SqlSection(
+            name=name,
+            start_line=start_line,
+            end_line=end_line,
+            external_tables=tuple(sorted(ext_tables)),
+        ))
+
+    return sections
+
+
+def scan_sql_sections(clean_sql: str) -> list[SqlSection]:
+    """Scan a Clean SQL View for SQL Sections (CTEs + main, or clause landmarks).
+
+    Returns an ordered list of SqlSection descriptors. For CTE-based queries,
+    returns every top-level CTE followed by ``main``. For plain SELECT/UNION
+    queries without CTEs, returns clause landmarks.
+    """
+    lines = clean_sql.splitlines()
+    cte_sections = _scan_ctes(clean_sql, lines)
+
+    if cte_sections:
+        main_section = _scan_main_section(clean_sql, lines, cte_sections)
+        return cte_sections + [main_section]
+
+    return _scan_clause_landmarks(clean_sql, lines)
