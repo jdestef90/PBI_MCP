@@ -14,7 +14,7 @@ Note: Mutation tools default to `dry_run=true` (preview ChangePlan); pass `dry_r
 - list_tables(workspace?: str, limit?: int, offset?: int): List all tables in the semantic model with column/measure counts and native SQL status.
 - get_table(table_name: str, workspace?: str): Retrieve complete table schema including columns, measures, relationships, and SQL source.
 - search_measures(query?: str, table?: str, workspace?: str, limit?: int, offset?: int): Find measures across the semantic model and return their table, name, DAX expression, and description.
-- get_table_sql(table_name?: str, partition?: str, outline?: bool, ctes?: list|str, start_line?: int, end_line?: int, format?: 'text'|'json', workspace?: str): Extract Partition SQL (Clean SQL View or outline) for a table.
+- get_table_sql(table_name?: str, partition?: str, outline?: bool, ctes?: list|str, start_line?: int, end_line?: int, search?: str, context_lines?: int, format?: 'text'|'json', workspace?: str): Extract or search Partition SQL (Clean SQL View or outline) across workspace, table, or SQL Sections.
 - analyze_impact(term: str, workspace?: str): Analyze where a measure or column is referenced across TMDL formulas and report visuals.
 
 ### Report Layout
@@ -24,7 +24,7 @@ Note: Mutation tools default to `dry_run=true` (preview ChangePlan); pass `dry_r
 
 ### Safe Mutations (dry_run=True default)
 - update_measure_dax(measure_name: str, expression: str, table?: str, create_if_missing?: bool, format_string?: str, display_folder?: str, description?: str, expected_current_expression?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Update an existing measure's DAX expression in TMDL (or create a new measure when create_if_missing=True).
-- update_table_sql(old_text: str, new_text: str, table_name?: str, partition?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Surgically replace a line or block inside a table's Value.NativeQuery SQL expression.
+- update_table_sql(table_name?: str, old_text?: str, new_text?: str, cte?: str, start_line?: int, end_line?: int, after_cte?: str, before_cte?: str, delete_cte?: bool, edits?: list, partition?: str, expected_replacements?: int, expected_sql_hash?: str, format?: 'text'|'json', workspace?: str, dry_run?: bool): Safely edit a table's Partition SQL against the Clean SQL View with diff preview.
 - update_visual_fields(visual_id_or_title: str, add_fields?: list, remove_fields?: list, page?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Add or remove measures and columns on a visual without modifying visual styling or layout.
 - rename_measure(old_name: str, new_name: str, table?: str, expected_replacements?: int, workspace?: str, dry_run?: bool): Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals.
 
