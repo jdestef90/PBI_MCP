@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -17,12 +16,13 @@ from .m_codec import (
 )
 from .models import MutationDiff
 from .sql_sections import (
+    LineIndex,
     SqlSection,
     SqlStructure,
-    _extract_table_refs,
-    _find_matching_rparen_token,
-    _tokenize_sql,
+    extract_table_refs,
+    find_matching_rparen_token,
     scan_sql_structure,
+    tokenize_sql,
     unquote_sql_identifier,
 )
 
@@ -38,7 +38,6 @@ _BATCH_EDIT_ALLOWED_KEYS = frozenset({
     "after_cte",
     "before_cte",
     "delete_cte",
-    "expected_replacements",
 })
 
 
@@ -138,63 +137,17 @@ def apply_text_edit(
     expected_replacements: int | None = None,
 ) -> tuple[str, int, str]:
     """Apply exact substring replacement, falling back to whitespace-normalized matching."""
-    old_norm = _normalize_newlines(old_text)
-    new_norm = _normalize_newlines(new_text)
-
-    exact_count = clean_sql.count(old_norm)
-    if exact_count > 0:
-        return clean_sql.replace(old_norm, new_norm), exact_count, "exact"
-
-    sql_lines = clean_sql.split("\n")
-    old_for_lines = (
-        old_norm[:-1] if old_norm.endswith("\n") and not old_norm.endswith("\n\n") else old_norm
+    patches, count, match_mode = _find_text_edit_patches(
+        clean_sql,
+        0,
+        len(clean_sql),
+        old_text=old_text,
+        new_text=new_text,
+        expected_replacements=expected_replacements,
     )
-    new_for_lines = (
-        new_norm[:-1] if new_norm.endswith("\n") and not new_norm.endswith("\n\n") else new_norm
-    )
-    old_lines = old_for_lines.split("\n")
-    new_lines = [] if new_for_lines == "" else new_for_lines.split("\n")
-
-    span_len = len(old_lines)
-    if span_len == 0 or span_len > len(sql_lines):
-        return clean_sql, 0, "none"
-
-    old_stripped = [ln.strip(" \t") for ln in old_lines]
-    sql_stripped = [ln.strip(" \t") for ln in sql_lines]
-
-    match_starts: list[int] = []
-    idx = 0
-    limit = len(sql_lines) - span_len
-    while idx <= limit:
-        if sql_stripped[idx : idx + span_len] == old_stripped:
-            match_starts.append(idx)
-            idx += span_len
-        else:
-            idx += 1
-
-    if not match_starts:
-        return clean_sql, 0, "none"
-
-    if len(match_starts) > 1 and expected_replacements is None:
-        raise PreconditionFailedError(
-            f"Ambiguous whitespace-normalized match: found {len(match_starts)} matching "
-            "locations. Provide more context, exact indentation, or pass "
-            f"expected_replacements={len(match_starts)}.",
-            code="PRECONDITION_FAILED",
-            expected=1,
-            actual=len(match_starts),
-        )
-
-    out_lines: list[str] = []
-    cursor = 0
-    for start in match_starts:
-        out_lines.extend(sql_lines[cursor:start])
-        matched_block = sql_lines[start : start + span_len]
-        out_lines.extend(_reindent_replacement(matched_block, old_lines, new_lines))
-        cursor = start + span_len
-    out_lines.extend(sql_lines[cursor:])
-
-    return "\n".join(out_lines), len(match_starts), "whitespace_normalized"
+    if not patches:
+        return clean_sql, 0, match_mode
+    return apply_text_patches(clean_sql, patches), count, match_mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +159,13 @@ class TextPatch:
     replacement: str
     edit_index: int = 0
     label: str = ""
+
+    def __post_init__(self) -> None:
+        if self.start < 0 or self.end < self.start:
+            raise ValueError(
+                f"Invalid TextPatch span ({self.start}, {self.end}) for {self.label!r}: "
+                "must satisfy 0 <= start <= end."
+            )
 
 
 def _resolve_sql_section(
@@ -286,11 +246,7 @@ def _find_text_edit_patches(
         return patches, len(patches), "exact"
 
     # Whitespace-normalized line-block fallback within scope
-    line_starts: list[int] = [0]
-    nl_pos = scoped.find("\n")
-    while nl_pos != -1:
-        line_starts.append(nl_pos + 1)
-        nl_pos = scoped.find("\n", nl_pos + 1)
+    line_starts = LineIndex(scoped).line_starts
     sql_lines = scoped.split("\n")
 
     old_for_lines = (
@@ -332,26 +288,31 @@ def _find_text_edit_patches(
             actual=len(match_starts),
         )
 
+    deleted_line_set = (
+        {ln for s in match_starts for ln in range(s, s + span_len)} if not new_lines else set()
+    )
     for start_idx in match_starts:
         end_idx = start_idx + span_len - 1
         matched_block = sql_lines[start_idx : end_idx + 1]
         reindented = _reindent_replacement(matched_block, old_lines, new_lines)
+        line_end = line_starts[end_idx + 1] - 1 if end_idx + 1 < len(sql_lines) else len(scoped)
         if reindented:
             rel_start = line_starts[start_idx]
-            rel_end = (
-                line_starts[end_idx + 1] - 1 if end_idx + 1 < len(sql_lines) else len(scoped)
-            )
+            rel_end = line_end
             rep_str = "\n".join(reindented)
         else:
-            if end_idx + 1 < len(sql_lines):
+            has_surviving_after = any(
+                j not in deleted_line_set for j in range(end_idx + 1, len(sql_lines))
+            )
+            if has_surviving_after:
                 rel_start = line_starts[start_idx]
                 rel_end = line_starts[end_idx + 1]
             elif start_idx > 0:
                 rel_start = line_starts[start_idx] - 1
-                rel_end = len(scoped)
+                rel_end = line_end
             else:
                 rel_start = 0
-                rel_end = len(scoped)
+                rel_end = line_end
             rep_str = ""
         patches.append(
             TextPatch(
@@ -439,7 +400,7 @@ def _format_cte_body_lines(raw_body: str, *, target_indent: str) -> list[str]:
 def _unwrap_cte_body(raw_body: str, cte_name: str) -> tuple[str, str | None]:
     """Unwrap accidental `[WITH] <cte> AS (...) [,]` or outer `(...) [,]` wrappers."""
     norm = _normalize_newlines(raw_body)
-    tokens = _tokenize_sql(norm)
+    tokens = tokenize_sql(norm)
     if not tokens:
         return norm, None
 
@@ -458,7 +419,7 @@ def _unwrap_cte_body(raw_body: str, cte_name: str) -> tuple[str, str | None]:
     ):
         j = idx + 1
         if j < n and tokens[j].kind == "lparen":
-            col_close = _find_matching_rparen_token(tokens, j)
+            col_close = find_matching_rparen_token(tokens, j)
             if col_close is not None:
                 j = col_close + 1
         if j < n and tokens[j].kind == "word" and tokens[j].upper == "AS":
@@ -474,7 +435,7 @@ def _unwrap_cte_body(raw_body: str, cte_name: str) -> tuple[str, str | None]:
             elif j < n and tokens[j].kind == "word" and tokens[j].upper == "MATERIALIZED":
                 j += 1
             if j < n and tokens[j].kind == "lparen":
-                close_idx = _find_matching_rparen_token(tokens, j)
+                close_idx = find_matching_rparen_token(tokens, j)
                 if close_idx is not None and (
                     close_idx == n - 1
                     or (close_idx == n - 2 and tokens[-1].kind == "comma")
@@ -487,7 +448,7 @@ def _unwrap_cte_body(raw_body: str, cte_name: str) -> tuple[str, str | None]:
                     return inner, note
 
     if tokens[0].kind == "lparen":
-        close_idx = _find_matching_rparen_token(tokens, 0)
+        close_idx = find_matching_rparen_token(tokens, 0)
         if close_idx is not None and (
             close_idx == n - 1 or (close_idx == n - 2 and tokens[-1].kind == "comma")
         ):
@@ -827,9 +788,15 @@ def build_cte_delete_patches(
     deleted_names = [sec.name for _, _, sec in resolved]
     has_insertions = bool(insert_slots)
 
-    # Deleting ALL existing CTEs (with no new CTEs inserted) removes the entire WITH clause
-    if len(deleted_idx_set) == len(cte_sections) and not has_insertions:
-        tokens = _tokenize_sql(clean_sql)
+    # Deleting ALL existing CTEs removes the entire WITH clause (unless insertions also occur)
+    if len(deleted_idx_set) == len(cte_sections):
+        if has_insertions:
+            raise InvalidArgumentError(
+                "Conflicting batch edits: cannot delete all existing CTEs while inserting a "
+                "new CTE in the same batch; replace an existing CTE or apply in separate calls.",
+                code="INVALID_ARGUMENT",
+            )
+        tokens = tokenize_sql(clean_sql)
         with_start = tokens[0].start if tokens else 0
         del_start = _line_start_if_ws_only(clean_sql, with_start)
         last_cte = cte_sections[-1]
@@ -871,7 +838,7 @@ def build_cte_delete_patches(
         if has_surviving_after and idx + 1 < len(cte_sections):
             next_sec = cte_sections[idx + 1]
             between = clean_sql[sec.outer_span[1] : next_sec.outer_span[0]]
-            between_tokens = _tokenize_sql(between)
+            between_tokens = tokenize_sql(between)
             comma_tok = next((t for t in between_tokens if t.kind == "comma"), None)
             if comma_tok is not None and between[comma_tok.end :].strip() != "":
                 # Preserve comments between comma and next_sec
@@ -886,10 +853,16 @@ def build_cte_delete_patches(
             else:
                 del_start = sec.outer_span[0]
                 del_end = next_sec.outer_span[0]
-        else:
+        elif idx > 0:
             prev_sec = cte_sections[idx - 1]
             del_start = prev_sec.outer_span[1]
             del_end = sec.outer_span[1]
+        else:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: cannot delete first CTE {sec.name!r} without a "
+                "surviving subsequent CTE while inserting in the same batch.",
+                code="INVALID_ARGUMENT",
+            )
 
         patches.append(
             TextPatch(
@@ -923,8 +896,8 @@ def detect_deleted_cte_reference_warnings(
         referencing: list[str] = []
         for sec in after_struct.sections:
             span = sec.inner_span if sec.kind == "cte" else sec.outer_span
-            sec_tokens = _tokenize_sql(updated_clean_sql[span[0] : span[1]])
-            refs, _ = _extract_table_refs(
+            sec_tokens = tokenize_sql(updated_clean_sql[span[0] : span[1]])
+            refs, _ = extract_table_refs(
                 sec_tokens,
                 cte_names_by_cf={del_cf: del_name},
                 self_name_cf=None,
@@ -1003,11 +976,7 @@ def build_line_range_patch(
             },
         )
 
-    line_starts: list[int] = [0]
-    nl_pos = clean_sql.find("\n")
-    while nl_pos != -1:
-        line_starts.append(nl_pos + 1)
-        nl_pos = clean_sql.find("\n", nl_pos + 1)
+    line_starts = LineIndex(clean_sql).line_starts
 
     eff_new, _ = strip_line_number_prefixes(new_text)
     norm_new = _normalize_newlines(eff_new)
@@ -1265,6 +1234,7 @@ def apply_batch_edits(
         )
 
     # Cross-edit semantic conflict validation
+    cte_sections = [s for s in struct.sections if s.kind == "cte"]
     for cf, del_idx in deleted_cte_cfs.items():
         if cf in whole_replaced_cfs:
             raise InvalidArgumentError(
@@ -1286,6 +1256,12 @@ def apply_batch_edits(
                 f"(deleted in edit #{deleted_cte_cfs[anchor_cf] + 1}).",
                 code="INVALID_ARGUMENT",
             )
+    if cte_sections and len(deleted_cte_cfs) == len(cte_sections) and inserted_cte_cfs:
+        raise InvalidArgumentError(
+            "Conflicting batch edits: cannot delete all existing CTEs while inserting a "
+            "new CTE in the same batch; replace an existing CTE or apply in separate calls.",
+            code="INVALID_ARGUMENT",
+        )
     for cf, rep_idx in whole_replaced_cfs.items():
         if cf in scoped_cfs:
             raise InvalidArgumentError(
@@ -1338,7 +1314,6 @@ def apply_batch_edits(
             notes_and_warnings.extend(notes)
             total_replacements += 1
         elif mode in {"cte_text", "global_text"}:
-            entry_expected = entry.get("expected_replacements")
             if mode == "cte_text":
                 sec = _resolve_sql_section(struct, entry["cte"])
                 scope_start, scope_end = _section_text_scope(clean_sql, sec)
@@ -1354,18 +1329,9 @@ def apply_batch_edits(
                 scope_end,
                 old_text=entry["old_text"],
                 new_text=entry["new_text"],
-                expected_replacements=entry_expected,
                 edit_index=idx,
                 label=label,
             )
-            if entry_expected is not None and count != entry_expected:
-                raise PreconditionFailedError(
-                    f"Batch edit #{idx + 1}: expected {entry_expected} replacement(s)"
-                    f"{scope_desc}, but found {count}; no edits were applied.",
-                    code="PRECONDITION_FAILED",
-                    expected=entry_expected,
-                    actual=count,
-                )
             if count == 0:
                 raise PreconditionFailedError(
                     f"Batch edit #{idx + 1}: matched 0 occurrences of old_text"
@@ -1693,46 +1659,13 @@ def apply_line_range_edit(
     new_text: str,
 ) -> tuple[str, int]:
     """Replace an inclusive 1-based line range in Clean SQL View."""
-    if start_line is None:
-        raise InvalidArgumentError(
-            "start_line is required when end_line is provided.",
-            code="INVALID_ARGUMENT",
-        )
-    eff_end = start_line if end_line is None else end_line
-    if start_line < 1:
-        raise InvalidArgumentError(
-            f"start_line must be >= 1 (received {start_line}).",
-            code="INVALID_ARGUMENT",
-        )
-    if eff_end < 1:
-        raise InvalidArgumentError(
-            f"end_line must be >= 1 (received {eff_end}).",
-            code="INVALID_ARGUMENT",
-        )
-    if eff_end < start_line:
-        raise InvalidArgumentError(
-            f"end_line ({eff_end}) must be >= start_line ({start_line}).",
-            code="INVALID_ARGUMENT",
-        )
-
-    lines = clean_sql.split("\n") if clean_sql != "" else []
-    line_count = len(lines)
-    if start_line > line_count or eff_end > line_count:
-        raise InvalidArgumentError(
-            f"Line range {start_line}-{eff_end} is out of bounds for query with "
-            f"{line_count} line(s).",
-            code="INVALID_ARGUMENT",
-            details={
-                "start_line": start_line,
-                "end_line": eff_end,
-                "line_count": line_count,
-            },
-        )
-
-    norm_new = new_text.replace("\r\n", "\n").replace("\r", "\n")
-    replacement_lines = [] if norm_new == "" else norm_new.splitlines()
-    updated_lines = lines[: start_line - 1] + replacement_lines + lines[eff_end:]
-    updated_sql = "\n".join(updated_lines)
+    patch = build_line_range_patch(
+        clean_sql,
+        start_line=start_line,
+        end_line=end_line,
+        new_text=new_text,
+    )
+    updated_sql = apply_text_patches(clean_sql, [patch])
     replacements = 0 if updated_sql == clean_sql else 1
     return updated_sql, replacements
 
@@ -1745,35 +1678,19 @@ def build_clean_sql_diff(
     context_lines: int = 3,
 ) -> MutationDiff:
     """Build a unified diff over Clean SQL View without glued trailing lines."""
+    from .mutation import build_mutation_diff
+
     before_norm = before_sql.replace("\r\n", "\n")
     after_norm = after_sql.replace("\r\n", "\n")
     if before_norm and not before_norm.endswith("\n"):
         before_norm += "\n"
     if after_norm and not after_norm.endswith("\n"):
         after_norm += "\n"
-    diff_text = "".join(
-        difflib.unified_diff(
-            before_norm.splitlines(keepends=True),
-            after_norm.splitlines(keepends=True),
-            fromfile=f"a/{rel_file}",
-            tofile=f"b/{rel_file}",
-            n=context_lines,
-        )
-    )
-    lines_added = 0
-    lines_removed = 0
-    for dline in diff_text.splitlines():
-        if dline.startswith("+++") or dline.startswith("---"):
-            continue
-        if dline.startswith("+"):
-            lines_added += 1
-        elif dline.startswith("-"):
-            lines_removed += 1
-    return MutationDiff(
-        file=rel_file,
-        unified_diff=diff_text,
-        lines_added=lines_added,
-        lines_removed=lines_removed,
+    return build_mutation_diff(
+        rel_file,
+        before_norm,
+        after_norm,
+        context_lines=context_lines,
     )
 
 

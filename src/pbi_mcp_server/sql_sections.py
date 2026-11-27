@@ -77,7 +77,7 @@ _SELECT_TERMINATORS: frozenset[str] = frozenset({
 
 
 @dataclass(frozen=True, slots=True)
-class _SqlToken:
+class SqlToken:
     kind: TokenKind
     text: str
     start: int
@@ -145,7 +145,7 @@ class SqlStructure:
     selected_fields: tuple[str, ...]
 
 
-class _LineIndex:
+class LineIndex:
     """Fast 1-based line lookup for character offsets in Clean SQL View."""
 
     def __init__(self, text: str) -> None:
@@ -155,6 +155,10 @@ class _LineIndex:
             starts.append(pos + 1)
             pos = text.find("\n", pos + 1)
         self._starts = starts
+
+    @property
+    def line_starts(self) -> list[int]:
+        return self._starts
 
     def line_of(self, offset: int) -> int:
         if offset <= 0:
@@ -184,7 +188,7 @@ class _RawCte:
     outer_end: int
     inner_start: int
     inner_end: int
-    body_tokens: list[_SqlToken]
+    body_tokens: list[SqlToken]
 
 
 def _scan_quoted_end(sql: str, start: int, quote: str, *, allow_backslash: bool) -> int:
@@ -205,9 +209,9 @@ def _scan_quoted_end(sql: str, start: int, quote: str, *, allow_backslash: bool)
     return n
 
 
-def _tokenize_sql(sql: str) -> list[_SqlToken]:
+def tokenize_sql(sql: str) -> list[SqlToken]:
     """Tokenize Databricks/ANSI SQL while skipping whitespace and comments."""
-    tokens: list[_SqlToken] = []
+    tokens: list[SqlToken] = []
     n = len(sql)
     i = 0
     while i < n:
@@ -229,25 +233,25 @@ def _tokenize_sql(sql: str) -> list[_SqlToken]:
         if sql.startswith("{{m:", i):
             found_end = scan_m_placeholder_end(sql, i)
             end = n if found_end < 0 else found_end
-            tokens.append(_SqlToken("placeholder", sql[i:end], i, end))
+            tokens.append(SqlToken("placeholder", sql[i:end], i, end))
             i = end
             continue
         # Single-quoted string literal
         if ch == "'":
             end = _scan_quoted_end(sql, i, "'", allow_backslash=True)
-            tokens.append(_SqlToken("string", sql[i:end], i, end))
+            tokens.append(SqlToken("string", sql[i:end], i, end))
             i = end
             continue
         # Double-quoted identifier / literal
         if ch == '"':
             end = _scan_quoted_end(sql, i, '"', allow_backslash=True)
-            tokens.append(_SqlToken("ident", sql[i:end], i, end))
+            tokens.append(SqlToken("ident", sql[i:end], i, end))
             i = end
             continue
         # Backtick identifier (Databricks/Spark SQL)
         if ch == "`":
             end = _scan_quoted_end(sql, i, "`", allow_backslash=False)
-            tokens.append(_SqlToken("ident", sql[i:end], i, end))
+            tokens.append(SqlToken("ident", sql[i:end], i, end))
             i = end
             continue
         # Bracketed identifier (T-SQL)
@@ -261,42 +265,42 @@ def _tokenize_sql(sql: str) -> list[_SqlToken]:
                     end += 1
                     break
                 end += 1
-            tokens.append(_SqlToken("ident", sql[i:end], i, end))
+            tokens.append(SqlToken("ident", sql[i:end], i, end))
             i = end
             continue
         if ch == "(":
-            tokens.append(_SqlToken("lparen", ch, i, i + 1))
+            tokens.append(SqlToken("lparen", ch, i, i + 1))
             i += 1
             continue
         if ch == ")":
-            tokens.append(_SqlToken("rparen", ch, i, i + 1))
+            tokens.append(SqlToken("rparen", ch, i, i + 1))
             i += 1
             continue
         if ch == ",":
-            tokens.append(_SqlToken("comma", ch, i, i + 1))
+            tokens.append(SqlToken("comma", ch, i, i + 1))
             i += 1
             continue
         if ch == ".":
-            tokens.append(_SqlToken("dot", ch, i, i + 1))
+            tokens.append(SqlToken("dot", ch, i, i + 1))
             i += 1
             continue
         if ch == "*":
-            tokens.append(_SqlToken("star", ch, i, i + 1))
+            tokens.append(SqlToken("star", ch, i, i + 1))
             i += 1
             continue
         if ch.isalpha() or ch == "_":
             end = i + 1
             while end < n and (sql[end].isalnum() or sql[end] in "_$"):
                 end += 1
-            tokens.append(_SqlToken("word", sql[i:end], i, end))
+            tokens.append(SqlToken("word", sql[i:end], i, end))
             i = end
             continue
-        tokens.append(_SqlToken("other", ch, i, i + 1))
+        tokens.append(SqlToken("other", ch, i, i + 1))
         i += 1
     return tokens
 
 
-def _find_matching_rparen_token(tokens: list[_SqlToken], lparen_idx: int) -> int | None:
+def find_matching_rparen_token(tokens: list[SqlToken], lparen_idx: int) -> int | None:
     """Return token index of the `)` matching `tokens[lparen_idx]`."""
     depth = 0
     for idx in range(lparen_idx, len(tokens)):
@@ -310,8 +314,8 @@ def _find_matching_rparen_token(tokens: list[_SqlToken], lparen_idx: int) -> int
     return None
 
 
-def _extract_table_refs(
-    tokens: list[_SqlToken],
+def extract_table_refs(
+    tokens: list[SqlToken],
     *,
     cte_names_by_cf: dict[str, str],
     self_name_cf: str | None = None,
@@ -358,7 +362,7 @@ def _extract_table_refs(
                 continue
 
             # Consume dot-qualified name parts: catalog.schema.table or {{m:Cat}}.{{m:Sch}}.tbl
-            parts: list[_SqlToken] = [nxt]
+            parts: list[SqlToken] = [nxt]
             k = j + 1
             while k + 1 < n and tokens[k].kind == "dot":
                 part_tok = tokens[k + 1]
@@ -394,7 +398,7 @@ def _extract_table_refs(
     return tuple(cte_refs), tuple(source_tables)
 
 
-def _extract_selected_fields_from_tokens(tokens: list[_SqlToken]) -> tuple[str, ...]:
+def _extract_selected_fields_from_tokens(tokens: list[SqlToken]) -> tuple[str, ...]:
     """Extract projected column/alias names from the top-level SELECT clause of `main`."""
     n = len(tokens)
     # Find the first top-level SELECT token (unwrapping outer parens if the query is `(SELECT ...)`)
@@ -409,7 +413,7 @@ def _extract_selected_fields_from_tokens(tokens: list[_SqlToken]) -> tuple[str, 
             select_idx = idx
             break
     if select_idx is None and tokens and tokens[0].kind == "lparen":
-        end_p = _find_matching_rparen_token(tokens, 0)
+        end_p = find_matching_rparen_token(tokens, 0)
         if end_p is not None:
             return _extract_selected_fields_from_tokens(tokens[1:end_p])
     if select_idx is None:
@@ -422,14 +426,14 @@ def _extract_selected_fields_from_tokens(tokens: list[_SqlToken]) -> tuple[str, 
     if i < n and tokens[i].kind == "word" and tokens[i].upper == "TOP":
         i += 1
         if i < n and tokens[i].kind == "lparen":
-            close = _find_matching_rparen_token(tokens, i)
+            close = find_matching_rparen_token(tokens, i)
             i = (close + 1) if close is not None else i + 1
         elif i < n:
             i += 1
 
     # Collect projection items up to top-level FROM (or another clause terminator / semicolon)
-    items: list[list[_SqlToken]] = []
-    current: list[_SqlToken] = []
+    items: list[list[SqlToken]] = []
+    current: list[SqlToken] = []
     depth = 0
     while i < n:
         tok = tokens[i]
@@ -479,7 +483,7 @@ def _extract_selected_fields_from_tokens(tokens: list[_SqlToken]) -> tuple[str, 
 
 
 def _scan_clause_landmarks(
-    tokens: list[_SqlToken], line_index: _LineIndex
+    tokens: list[SqlToken], line_index: LineIndex
 ) -> tuple[ClauseLandmark, ...]:
     """Scan top-level SQL clause landmarks for non-CTE queries."""
     if not tokens:
@@ -580,7 +584,7 @@ def _scan_clause_landmarks(
 
 def scan_sql_structure(clean_sql: str) -> SqlStructure:
     """Scan Clean SQL View into SQL Sections (CTEs + `main`), clause landmarks, and metadata."""
-    tokens = _tokenize_sql(clean_sql)
+    tokens = tokenize_sql(clean_sql)
     if not tokens:
         return SqlStructure(
             has_ctes=False,
@@ -590,7 +594,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
             selected_fields=(),
         )
 
-    line_index = _LineIndex(clean_sql)
+    line_index = LineIndex(clean_sql)
     n = len(tokens)
 
     # Parse top-level WITH / WITH RECURSIVE CTE definitions
@@ -612,7 +616,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
 
             # Optional CTE column list: `cte_name (col1, col2)`
             if j < n and tokens[j].kind == "lparen":
-                col_close = _find_matching_rparen_token(tokens, j)
+                col_close = find_matching_rparen_token(tokens, j)
                 if col_close is None:
                     break
                 j = col_close + 1
@@ -636,7 +640,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
 
             if j >= n or tokens[j].kind != "lparen":
                 break
-            close_idx = _find_matching_rparen_token(tokens, j)
+            close_idx = find_matching_rparen_token(tokens, j)
             if close_idx is None:
                 break
 
@@ -671,7 +675,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
     all_source_tables: list[str] = []
 
     for cte in raw_ctes:
-        refs, srcs = _extract_table_refs(
+        refs, srcs = extract_table_refs(
             cte.body_tokens,
             cte_names_by_cf=cte_names_by_cf,
             self_name_cf=cte.name.casefold(),
@@ -698,7 +702,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
     main_tokens = tokens[main_start_tok_idx:] if has_ctes else tokens
     selected_fields: tuple[str, ...] = ()
     if main_tokens:
-        main_refs, main_srcs = _extract_table_refs(
+        main_refs, main_srcs = extract_table_refs(
             main_tokens,
             cte_names_by_cf=cte_names_by_cf,
             self_name_cf=None,

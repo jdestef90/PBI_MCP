@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,12 +29,17 @@ from .sql_edit import (
     apply_text_edit,
     apply_whole_cte_replace_edit,
     detect_dynamic_param_warnings,
-    strip_line_number_prefixes,
     validate_clean_sql_delimiters,
     validate_m_reencoding,
     verify_sql_hash_precondition,
 )
-from .sql_sections import SqlSection, SqlStructure, scan_sql_structure, unquote_sql_identifier
+from .sql_sections import (
+    LineIndex,
+    SqlSection,
+    SqlStructure,
+    scan_sql_structure,
+    unquote_sql_identifier,
+)
 
 _PARTITION_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)partition\s+"
@@ -615,21 +619,6 @@ def _slice_sql_lines(
     return sliced, eff_start, eff_end, next_hints
 
 
-def _build_line_starts(text: str) -> list[int]:
-    starts = [0]
-    pos = text.find("\n")
-    while pos != -1:
-        starts.append(pos + 1)
-        pos = text.find("\n", pos + 1)
-    return starts
-
-
-def _line_of_offset(line_starts: list[int], offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return bisect_right(line_starts, offset)
-
-
 def _find_enclosing_section(
     sections: tuple[SqlSection, ...], offset: int, line_num: int
 ) -> SqlSection | None:
@@ -724,7 +713,7 @@ def _search_table_sql_view(
         lines = clean.splitlines()
         line_count = len(lines)
         structure = scan_sql_structure(clean)
-        line_starts = _build_line_starts(clean)
+        line_index = LineIndex(clean)
 
         allowed_sections_by_cf: dict[str, SqlSection] | None = None
         if requested_ctes is not None:
@@ -759,8 +748,8 @@ def _search_table_sql_view(
         for match in compiled.finditer(clean):
             m_start = match.start()
             m_end_pos = max(m_start, match.end() - 1)
-            start_ln = _line_of_offset(line_starts, m_start)
-            end_ln = _line_of_offset(line_starts, m_end_pos)
+            start_ln = line_index.line_of(m_start)
+            end_ln = line_index.line_of(m_end_pos)
             start_sec = _find_enclosing_section(structure.sections, m_start, start_ln)
             end_sec = _find_enclosing_section(structure.sections, m_end_pos, end_ln)
 
@@ -779,7 +768,9 @@ def _search_table_sql_view(
                 elif ln == end_ln:
                     ln_sec = end_sec
                 else:
-                    ln_sec = _find_enclosing_section(structure.sections, line_starts[ln - 1], ln)
+                    ln_sec = _find_enclosing_section(
+                        structure.sections, line_index.line_starts[ln - 1], ln
+                    )
                 sec_name = ln_sec.name if ln_sec is not None else None
                 key = (ln, sec_name)
                 if key not in seen_line_sec:
@@ -1110,6 +1101,21 @@ def search_table_sql(
     }
 
 
+def _validate_and_encode_sql_edit(
+    before_clean: str,
+    updated_clean: str,
+    descriptor: MSerializationDescriptor | None,
+) -> tuple[str, list[str]]:
+    """Run Clean SQL delimiter checks, M re-encoding verification, and {{m:...}} warnings."""
+    validate_clean_sql_delimiters(updated_clean)
+    if descriptor is not None:
+        updated_m = encode_sql_to_m(updated_clean, descriptor)
+        validate_m_reencoding(updated_clean, updated_m, descriptor)
+    else:
+        updated_m = updated_clean
+    return updated_m, detect_dynamic_param_warnings(before_clean, updated_clean)
+
+
 def update_table_sql(
     semantic_model_dir: Path,
     old_text: str | None = None,
@@ -1245,15 +1251,6 @@ def update_table_sql(
         if edits is not None:
             updated_clean, count, batch_notes = apply_batch_edits(clean, edits)
             warnings.extend(batch_notes)
-            if not count:
-                continue
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             reason = (
                 f"apply atomic batch of {len(edits)} SQL edit(s) in partition {source.partition!r}"
             )
@@ -1264,32 +1261,15 @@ def update_table_sql(
                 cte=cte,
             )
             warnings.extend(del_warnings)
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             reason = f"delete CTE {sec_name!r} in partition {source.partition!r}"
         elif has_line_range:
             assert new_text is not None
-            eff_new, _ = strip_line_number_prefixes(new_text)
             updated_clean, count = apply_line_range_edit(
                 clean,
                 start_line=start_line,
                 end_line=end_line,
-                new_text=eff_new,
+                new_text=new_text,
             )
-            if not count:
-                continue
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             eff_end = start_line if end_line is None else end_line
             reason = f"replace lines {start_line}-{eff_end} in partition {source.partition!r}"
         elif has_insert_anchor:
@@ -1303,13 +1283,6 @@ def update_table_sql(
                 before_cte=before_cte,
             )
             warnings.extend(cte_notes)
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             reason = f"insert CTE {sec_name!r} in partition {source.partition!r}"
         elif cte is not None and old_text is not None:
             assert new_text is not None
@@ -1320,15 +1293,6 @@ def update_table_sql(
                 new_text=new_text,
                 expected_replacements=expected_replacements,
             )
-            if not count:
-                continue
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             reason = (
                 f"replace SQL fragment ({match_mode}) in SQL Section {sec_name!r} "
                 f"of partition {source.partition!r}"
@@ -1341,49 +1305,31 @@ def update_table_sql(
                 new_text=new_text,
             )
             warnings.extend(cte_notes)
-            if not count:
-                continue
-            validate_clean_sql_delimiters(updated_clean)
-            if source.descriptor is not None:
-                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-            else:
-                updated_m = updated_clean
-            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             reason = f"replace SQL Section {sec_name!r} in partition {source.partition!r}"
         else:
             assert old_text is not None
             assert new_text is not None
-            eff_old, old_stripped = strip_line_number_prefixes(old_text, reference_sql=clean)
-            eff_new, _ = strip_line_number_prefixes(
-                new_text,
-                reference_sql=None if old_stripped else clean,
-            )
             updated_clean, count, match_mode = apply_text_edit(
                 clean,
-                old_text=eff_old,
-                new_text=eff_new,
+                old_text=old_text,
+                new_text=new_text,
                 expected_replacements=expected_replacements,
             )
-            if count:
-                validate_clean_sql_delimiters(updated_clean)
-                if source.descriptor is not None:
-                    updated_m = encode_sql_to_m(updated_clean, source.descriptor)
-                    validate_m_reencoding(updated_clean, updated_m, source.descriptor)
-                else:
-                    updated_m = updated_clean
-                warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
-            else:
-                count = source.sql_expression.count(eff_old)
-                if not count:
-                    continue
-                updated_m = source.sql_expression.replace(eff_old, eff_new)
-                updated_clean = updated_m
             reason = (
                 f"replace SQL fragment ({match_mode}) in partition {source.partition!r}"
                 if match_mode == "whitespace_normalized"
                 else f"replace SQL fragment in partition {source.partition!r}"
             )
+
+        if not count:
+            continue
+
+        updated_m, param_warnings = _validate_and_encode_sql_edit(
+            clean,
+            updated_clean,
+            source.descriptor,
+        )
+        warnings.extend(param_warnings)
 
         total += count
         last_before_clean = clean

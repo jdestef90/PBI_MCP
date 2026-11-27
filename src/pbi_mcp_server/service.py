@@ -233,6 +233,14 @@ class PbipService:
                     "sql_section_counts": {
                         s["partition"]: s["sql_section_count"] for s in summaries
                     },
+                    "source_tables": {
+                        s["partition"]: list(s["sql_metadata"]["source_tables"])
+                        for s in summaries
+                    },
+                    "dynamic_parameters": {
+                        s["partition"]: list(s["sql_metadata"]["dynamic_parameters"])
+                        for s in summaries
+                    },
                 }
         return schema
 

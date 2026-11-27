@@ -1051,6 +1051,154 @@ def test_cte_and_batch_guardrails_hash_m_warnings_rollback_and_pbi_help(
     assert params["edits"]["type"] == "list"
 
 
+SINGLE_CTE_TMDL = (
+    "table SingleCteTable\n"
+    "\tlineageTag: 66666666-6666-6666-6666-666666666666\n"
+    "\n"
+    "\tcolumn id\n"
+    "\t\tdataType: int64\n"
+    "\t\tsourceColumn: id\n"
+    "\n"
+    "\tpartition SingleCteTable = m\n"
+    "\t\tmode: import\n"
+    "\t\tsource =\n"
+    "\t\t\tlet\n"
+    '\t\t\t    Source = Value.NativeQuery(Sql.Database("srv", "db"), '
+    '"WITH cte_only AS (#(lf)'
+    '    SELECT id FROM dbo.raw_only#(lf)'
+    ')#(lf)'
+    'SELECT id FROM cte_only")\n'
+    "\t\tin\n"
+    "\t\t\t    Source\n"
+)
+
+
+def test_batch_delete_cte_zero_anchor_conflicts_and_disallowed_keys(tmp_path: Path) -> None:
+    pbip = _clone_sample_workspace(tmp_path)
+    pipeline_path = _write_table_tmdl(pbip, "FactPipeline.tmdl", MULTI_CTE_DATABRICKS_TMDL)
+    single_path = _write_table_tmdl(pbip, "SingleCteTable.tmdl", SINGLE_CTE_TMDL)
+
+    srv = create_server(PbipService(pbip))
+
+    before_pipeline = pipeline_path.read_text(encoding="utf-8")
+    before_single = single_path.read_text(encoding="utf-8")
+
+    # 1. Deleting CTE 0 while using CTE 0 as before_cte or after_cte anchor must be rejected
+    for anchor_key in ("before_cte", "after_cte"):
+        with pytest.raises(Exception) as exc_anchor:
+            _call_tool_sync(
+                srv,
+                "update_table_sql",
+                {
+                    "table_name": "FactPipeline",
+                    "edits": [
+                        {"cte": "cte_x", "delete_cte": True},
+                        {"cte": "cte_new", anchor_key: "cte_x", "new_text": "SELECT 1 AS order_id"},
+                    ],
+                    "dry_run": False,
+                },
+            )
+        cause = exc_anchor.value.__cause__ or exc_anchor.value
+        assert getattr(cause, "code", None) == "INVALID_ARGUMENT"
+
+    # 2. Deleting ALL existing CTEs (including CTE 0) while inserting via before_cte="main"
+    #    must be rejected cleanly without negative-index wrap-around or SQL corruption
+    with pytest.raises(Exception) as exc_all_two:
+        _call_tool_sync(
+            srv,
+            "update_table_sql",
+            {
+                "table_name": "FactPipeline",
+                "edits": [
+                    {"cte": "cte_x", "delete_cte": True},
+                    {"cte": "cte_z", "delete_cte": True},
+                    {"cte": "cte_rep", "before_cte": "main", "new_text": "SELECT 1 AS order_id"},
+                ],
+                "dry_run": False,
+            },
+        )
+    all_two_cause = exc_all_two.value.__cause__ or exc_all_two.value
+    assert getattr(all_two_cause, "code", None) == "INVALID_ARGUMENT"
+    assert "all existing ctes" in str(all_two_cause).lower()
+
+    with pytest.raises(Exception) as exc_all_one:
+        _call_tool_sync(
+            srv,
+            "update_table_sql",
+            {
+                "table_name": "SingleCteTable",
+                "edits": [
+                    {"cte": "cte_only", "delete_cte": True},
+                    {"cte": "cte_rep", "before_cte": "main", "new_text": "SELECT 2 AS id"},
+                ],
+                "dry_run": False,
+            },
+        )
+    all_one_cause = exc_all_one.value.__cause__ or exc_all_one.value
+    assert getattr(all_one_cause, "code", None) == "INVALID_ARGUMENT"
+    assert "all existing ctes" in str(all_one_cause).lower()
+
+    # 3. Undocumented expected_replacements key inside a batch entry must be rejected
+    with pytest.raises(Exception) as exc_unknown_key:
+        _call_tool_sync(
+            srv,
+            "update_table_sql",
+            {
+                "table_name": "FactPipeline",
+                "edits": [
+                    {
+                        "cte": "cte_z",
+                        "old_text": "FROM cte_x x",
+                        "new_text": "FROM dbo.orders x",
+                        "expected_replacements": 1,
+                    }
+                ],
+                "dry_run": False,
+            },
+        )
+    key_cause = exc_unknown_key.value.__cause__ or exc_unknown_key.value
+    assert getattr(key_cause, "code", None) == "INVALID_ARGUMENT"
+    assert "expected_replacements" in str(key_cause)
+
+    assert pipeline_path.read_text(encoding="utf-8") == before_pipeline
+    assert single_path.read_text(encoding="utf-8") == before_single
+
+    # 4. Valid batch deleting CTE 0 while a later CTE survives and a new CTE is inserted after it
+    apply_res = _call_tool_sync(
+        srv,
+        "update_table_sql",
+        {
+            "table_name": "FactPipeline",
+            "edits": [
+                {"cte": "cte_x", "delete_cte": True},
+                {
+                    "cte": "cte_z",
+                    "old_text": "FROM cte_x x",
+                    "new_text": "FROM {{m:Catalog}}.{{m:Schema}}.orders x",
+                },
+                {
+                    "cte": "cte_post",
+                    "after_cte": "cte_z",
+                    "new_text": "SELECT z.order_id, z.amount FROM cte_z z",
+                },
+            ],
+            "dry_run": False,
+        },
+    ).content[0].text
+    assert "Status: applied" in apply_res
+    info = json.loads(
+        _call_tool_sync(
+            srv,
+            "get_table_sql",
+            {"table_name": "FactPipeline", "format": "json"},
+        ).content[0].text
+    )
+    assert [s["name"] for s in info["sections"]] == ["cte_z", "cte_post", "main"]
+    assert "cte_x" not in info["sql"]
+    assert info["sql"].startswith("WITH cte_z AS (")
+
+
+
 
 
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,17 +30,17 @@ def clone_sample_workspace(tmp_path: Path) -> Path:
     return tmp_path / "sample_project.pbip"
 
 
-def _parse_tool_result(res: object) -> dict[str, object] | list[object]:
+def _parse_tool_result(res: object) -> dict[str, Any] | list[Any]:
     """Extract JSON payload from MCPServer.call_tool result."""
     content = getattr(res, "content", res)
     if isinstance(content, list) and content:
-        items = [
+        items: list[Any] = [
             json.loads(getattr(item, "text", ""))
             for item in content
             if isinstance(getattr(item, "text", None), str)
         ]
-        if len(items) == 1:
-            return items[0]  # type: ignore[no-any-return]
+        if len(items) == 1 and isinstance(items[0], dict | list):
+            return items[0]
         if items:
             return items
     if isinstance(res, dict | list):
@@ -64,7 +65,7 @@ def test_pbi_help_lists_searches_and_inspects_tools(tmp_path: Path) -> None:
 
     filtered = _parse_tool_result(asyncio.run(srv.call_tool("pbi_help", {"query": "measure"})))
     assert isinstance(filtered, dict)
-    names = {t["tool_name"] for t in filtered["tools"]}  # type: ignore[index]
+    names = {t["tool_name"] for t in filtered["tools"]}
     assert "search_measures" in names
     assert "update_measure_dax" in names
 
@@ -73,7 +74,7 @@ def test_pbi_help_lists_searches_and_inspects_tools(tmp_path: Path) -> None:
     )
     assert isinstance(detail, dict)
     assert detail["tool_name"] == "update_measure_dax"
-    params = {p["name"]: p for p in detail["parameters"]}  # type: ignore[index]
+    params = {p["name"]: p for p in detail["parameters"]}
     assert params["measure_name"]["required"] is True
     assert params["dry_run"]["required"] is False
     assert params["dry_run"]["default"] is True
@@ -236,7 +237,7 @@ def test_pbi_help_and_compact_catalog_sql_tool_metadata(tmp_path: Path) -> None:
     )
     assert isinstance(get_sql_help, dict)
     assert get_sql_help["tool_name"] == "get_table_sql"
-    get_params = {p["name"]: p for p in get_sql_help["parameters"]}  # type: ignore[index]
+    get_params = {p["name"]: p for p in get_sql_help["parameters"]}
 
     expected_get_params: dict[str, tuple[str, bool, object]] = {
         "table_name": ("str", False, None),
@@ -263,7 +264,7 @@ def test_pbi_help_and_compact_catalog_sql_tool_metadata(tmp_path: Path) -> None:
     )
     assert isinstance(update_sql_help, dict)
     assert update_sql_help["tool_name"] == "update_table_sql"
-    update_params = {p["name"]: p for p in update_sql_help["parameters"]}  # type: ignore[index]
+    update_params = {p["name"]: p for p in update_sql_help["parameters"]}
 
     expected_update_params: dict[str, tuple[str, bool, object]] = {
         "table_name": ("str", False, None),
@@ -294,7 +295,7 @@ def test_pbi_help_and_compact_catalog_sql_tool_metadata(tmp_path: Path) -> None:
     # Verify pbi_help keyword search surfaces SQL navigation and CTE editing tools
     cte_hits = _parse_tool_result(asyncio.run(srv.call_tool("pbi_help", {"query": "cte"})))
     assert isinstance(cte_hits, dict)
-    cte_names = {t["tool_name"] for t in cte_hits["tools"]}  # type: ignore[index]
+    cte_names = {t["tool_name"] for t in cte_hits["tools"]}
     assert {"get_table_sql", "update_table_sql"}.issubset(cte_names)
 
     # Verify compact catalog stays concise and readable for small-model system prompts

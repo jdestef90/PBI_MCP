@@ -680,6 +680,24 @@ def test_update_table_sql_structural_validation_comments_m_param_warning_and_rol
     # Original .tmdl content must be restored identically on disk
     assert fenced_path.read_text(encoding="utf-8") == original_fenced
 
+    # 5. Raw-M escapes/concatenations do not bypass Clean SQL View matching or guardrails
+    raw_m_noop = json.loads(
+        _call_tool_sync(
+            direct_srv,
+            "update_table_sql",
+            {
+                "table_name": "FactEvents",
+                "old_text": "#(lf)",
+                "new_text": "'unterminated",
+                "format": "json",
+                "dry_run": False,
+            },
+        ).content[0].text
+    )
+    assert raw_m_noop["status"] == "no_op"
+    assert raw_m_noop["replacement_count"] == 0
+    assert events_path.read_text(encoding="utf-8") == original_events
+
 
 
 
