@@ -297,6 +297,7 @@ def test_get_table_sql_small_vs_large_default_and_explicit_outline(tmp_path: Pat
                 "table_name": "LargeCte",
                 "old_text": "WHERE f.metric_1 > 0",
                 "new_text": "WHERE f.metric_1 >= 10",
+                "format": "json",
                 "dry_run": True,
             },
         ).content[0].text

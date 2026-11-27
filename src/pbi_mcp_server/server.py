@@ -10,6 +10,7 @@ from .errors import AmbiguousWorkspaceError, InvalidArgumentError, WorkspaceNotF
 from .m_codec import format_get_table_sql_json, format_get_table_sql_text
 from .meta_tools import ToolSpec, build_pbi_help, dispatch_pbi_call, extract_tool_specs
 from .service import PbipService
+from .sql_edit import format_update_table_sql_text
 from .workspace_registry import WorkspaceRegistry
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -53,7 +54,7 @@ def _build_server_and_tools(
     def register_tool(fn: F) -> F:
         tools_map[fn.__name__] = fn
         if not meta_tools:
-            structured = False if fn.__name__ == "get_table_sql" else None
+            structured = False if fn.__name__ in {"get_table_sql", "update_table_sql"} else None
             mcp.add_tool(fn, structured_output=structured)
         return fn
 
@@ -428,11 +429,25 @@ def _build_server_and_tools(
 
     @register_tool
     def update_table_sql(
-        old_text: Annotated[str, Field(description="Exact SQL line or block to replace.")],
-        new_text: Annotated[str, Field(description="Replacement SQL line or block.")],
         table_name: Annotated[
             str | None,
             Field(description="Table name containing the SQL partition."),
+        ] = None,
+        old_text: Annotated[
+            str | None,
+            Field(description="SQL text to replace (forgiving leading-whitespace match)."),
+        ] = None,
+        new_text: Annotated[
+            str | None,
+            Field(description="Replacement SQL text (use '' to delete matched lines/text)."),
+        ] = None,
+        start_line: Annotated[
+            int | None,
+            Field(description="Inclusive 1-based start line in Clean SQL View to replace."),
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(description="Inclusive 1-based end line in Clean SQL View to replace."),
         ] = None,
         partition: Annotated[
             str | None,
@@ -442,18 +457,52 @@ def _build_server_and_tools(
             int | None,
             Field(description="Optional guard requiring an exact number of matches."),
         ] = None,
+        expected_sql_hash: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional precondition guard: sql_hash from get_table_sql that must "
+                    "match before editing."
+                )
+            ),
+        ] = None,
+        format: Annotated[
+            Literal["text", "json"],
+            Field(
+                description=(
+                    "Output format: 'text' (default, compact clean-SQL diff) or 'json'."
+                )
+            ),
+        ] = "text",
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
-    ) -> dict[str, Any]:
-        """Surgically replace a line or block inside a table's Value.NativeQuery SQL expression."""
-        return get_service(workspace).update_table_sql(
+    ) -> str | dict[str, Any]:
+        """Safely edit a table's Partition SQL against the Clean SQL View with diff preview."""
+        if format is None:
+            fmt = "text"
+        elif isinstance(format, str):
+            fmt = format.strip().lower()
+        else:
+            fmt = ""
+        if fmt not in {"text", "json"}:
+            raise InvalidArgumentError(
+                f"Unsupported format {format!r}; expected 'text' or 'json'.",
+                code="INVALID_ARGUMENT",
+            )
+        plan = get_service(workspace).update_table_sql(
             old_text,
             new_text,
             table_name=table_name,
             partition=partition,
+            start_line=start_line,
+            end_line=end_line,
             expected_replacements=expected_replacements,
+            expected_sql_hash=expected_sql_hash,
             dry_run=dry_run,
         )
+        if fmt == "json":
+            return plan
+        return format_update_table_sql_text(plan)
 
     @register_tool
     def update_visual_fields(
