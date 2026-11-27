@@ -6,6 +6,8 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .m_codec import scan_m_placeholder_end
+
 TokenKind = Literal[
     "word",
     "ident",
@@ -175,34 +177,14 @@ def unquote_sql_identifier(raw: str) -> str:
     return s
 
 
-def _scan_m_placeholder_end(sql: str, start: int) -> int:
-    """Scan `{{m:...}}` starting at `start`, honoring quoted M strings and nested braces."""
-    n = len(sql)
-    i = start + 4  # after "{{m:"
-    brace_depth = 0
-    in_str = False
-    while i < n:
-        ch = sql[i]
-        if in_str:
-            if sql.startswith('""', i):
-                i += 2
-                continue
-            if ch == '"':
-                in_str = False
-            i += 1
-            continue
-        if ch == '"':
-            in_str = True
-            i += 1
-            continue
-        if ch == "{":
-            brace_depth += 1
-        elif ch == "}":
-            if brace_depth == 0 and i + 1 < n and sql[i + 1] == "}":
-                return i + 2
-            brace_depth = max(0, brace_depth - 1)
-        i += 1
-    return n
+@dataclass(frozen=True, slots=True)
+class _RawCte:
+    name: str
+    outer_start: int
+    outer_end: int
+    inner_start: int
+    inner_end: int
+    body_tokens: list[_SqlToken]
 
 
 def _scan_quoted_end(sql: str, start: int, quote: str, *, allow_backslash: bool) -> int:
@@ -245,7 +227,8 @@ def _tokenize_sql(sql: str) -> list[_SqlToken]:
             continue
         # Dynamic M Parameter placeholder: {{m:<expr>}}
         if sql.startswith("{{m:", i):
-            end = _scan_m_placeholder_end(sql, i)
+            found_end = scan_m_placeholder_end(sql, i)
+            end = n if found_end < 0 else found_end
             tokens.append(_SqlToken("placeholder", sql[i:end], i, end))
             i = end
             continue
@@ -611,7 +594,7 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
     n = len(tokens)
 
     # Parse top-level WITH / WITH RECURSIVE CTE definitions
-    raw_ctes: list[tuple[str, int, int, int, int, list[_SqlToken]]] = []
+    raw_ctes: list[_RawCte] = []
     main_start_tok_idx = 0
 
     if tokens[0].kind == "word" and tokens[0].upper == "WITH":
@@ -661,7 +644,16 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
             inner_end = tokens[close_idx].start
             outer_end = tokens[close_idx].end
             body_tokens = tokens[j + 1 : close_idx]
-            raw_ctes.append((cte_name, outer_start, outer_end, inner_start, inner_end, body_tokens))
+            raw_ctes.append(
+                _RawCte(
+                    name=cte_name,
+                    outer_start=outer_start,
+                    outer_end=outer_end,
+                    inner_start=inner_start,
+                    inner_end=inner_end,
+                    body_tokens=body_tokens,
+                )
+            )
 
             i = close_idx + 1
             if i < n and tokens[i].kind == "comma":
@@ -673,31 +665,31 @@ def scan_sql_structure(clean_sql: str) -> SqlStructure:
             main_start_tok_idx = i
 
     has_ctes = bool(raw_ctes)
-    cte_names_by_cf: dict[str, str] = {name.casefold(): name for name, *_ in raw_ctes}
+    cte_names_by_cf: dict[str, str] = {cte.name.casefold(): cte.name for cte in raw_ctes}
 
     sections: list[SqlSection] = []
     all_source_tables: list[str] = []
 
-    for cte_name, outer_start, outer_end, inner_start, inner_end, body_tokens in raw_ctes:
+    for cte in raw_ctes:
         refs, srcs = _extract_table_refs(
-            body_tokens,
+            cte.body_tokens,
             cte_names_by_cf=cte_names_by_cf,
-            self_name_cf=cte_name.casefold(),
+            self_name_cf=cte.name.casefold(),
         )
         for tbl in srcs:
             if tbl not in all_source_tables:
                 all_source_tables.append(tbl)
-        start_line = line_index.line_of(outer_start)
-        end_line = max(start_line, line_index.line_of(max(outer_start, outer_end - 1)))
+        start_line = line_index.line_of(cte.outer_start)
+        end_line = max(start_line, line_index.line_of(max(cte.outer_start, cte.outer_end - 1)))
         sections.append(
             SqlSection(
-                name=cte_name,
+                name=cte.name,
                 kind="cte",
                 start_line=start_line,
                 end_line=end_line,
                 line_count=end_line - start_line + 1,
-                outer_span=(outer_start, outer_end),
-                inner_span=(inner_start, inner_end),
+                outer_span=(cte.outer_start, cte.outer_end),
+                inner_span=(cte.inner_start, cte.inner_end),
                 references_ctes=refs,
                 source_tables=srcs,
             )

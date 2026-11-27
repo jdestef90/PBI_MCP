@@ -889,6 +889,36 @@ def decode_m_sql_expression(
     return decoded, descriptor, dynamic_params
 
 
+def scan_m_placeholder_end(text: str, start: int) -> int:
+    """Return index immediately after `{{m:...}}` starting at `start`, or -1 if unclosed."""
+    n = len(text)
+    i = start + 4  # after "{{m:"
+    brace_depth = 0
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if text.startswith('""', i):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            if brace_depth == 0 and i + 1 < n and text[i + 1] == "}":
+                return i + 2
+            brace_depth = max(0, brace_depth - 1)
+        i += 1
+    return -1
+
+
 def split_clean_sql_segments(clean_sql: str) -> list[tuple[str, str]]:
     """Split Clean SQL View into `[('text', ...), ('expr', ...)]` segments."""
     segments: list[tuple[str, str]] = []
@@ -901,39 +931,13 @@ def split_clean_sql_segments(clean_sql: str) -> list[tuple[str, str]]:
             break
         if match.start() > pos:
             segments.append(("text", clean_sql[pos : match.start()]))
-        expr_start = match.end()
-        brace_depth = 0
-        in_str = False
-        i = expr_start
-        closed_at: int | None = None
-        while i < n:
-            ch = clean_sql[i]
-            if in_str:
-                if clean_sql.startswith('""', i):
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_str = False
-                i += 1
-                continue
-            if ch == '"':
-                in_str = True
-                i += 1
-                continue
-            if ch == "{":
-                brace_depth += 1
-            elif ch == "}":
-                if brace_depth == 0 and i + 1 < n and clean_sql[i + 1] == "}":
-                    closed_at = i
-                    break
-                brace_depth = max(0, brace_depth - 1)
-            i += 1
-        if closed_at is None:
+        end_pos = scan_m_placeholder_end(clean_sql, match.start())
+        if end_pos < 0:
             # Unclosed placeholder: keep remainder as literal text
             segments.append(("text", clean_sql[match.start() :]))
             break
-        segments.append(("expr", clean_sql[expr_start:closed_at].strip()))
-        pos = closed_at + 2
+        segments.append(("expr", clean_sql[match.end() : end_pos - 2].strip()))
+        pos = end_pos
     return segments
 
 

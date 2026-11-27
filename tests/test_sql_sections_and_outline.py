@@ -502,7 +502,9 @@ def test_get_table_sql_ctes_enforces_400_line_ceiling_with_continuation_hint(
     assert json_out["returned_line_count"] == 400
     assert json_out["total_requested_lines"] == 464
     assert len(json_out["sql"].splitlines()) == 400
-    assert any("start_line=401" in hint and "end_line=" in hint for hint in json_out["next_hints"])
+    hints = json_out["next_hints"]
+    assert any("start_line=401" in hint and "end_line=461" in hint for hint in hints)
+    assert any("ctes=['main']" in hint for hint in hints)
 
 
 def test_get_table_sql_line_range_slicing_defaults_and_json_parity(tmp_path: Path) -> None:
@@ -643,7 +645,22 @@ def test_get_table_multi_partition_summary_and_edge_case_sql_syntax(tmp_path: Pa
     assert recent_json["selected_fields"] == ["yr"]
     assert [s["name"] for s in recent_json["sections"]] == ["recent_cte", "main"]
 
-    # 3. pbi_help exposes outline, ctes, start_line, end_line
+    # 3. Multi-partition outline hints preserve partition parameter
+    outline_json = json.loads(
+        _call_tool_sync(
+            direct_srv,
+            "get_table_sql",
+            {
+                "table_name": "MultiCteTable",
+                "partition": "PartRecent",
+                "outline": True,
+                "format": "json",
+            },
+        ).content[0].text
+    )
+    assert all("partition='PartRecent'" in hint for hint in outline_json["next_hints"])
+
+    # 4. pbi_help exposes outline, ctes, start_line, end_line
     help_res = json.loads(
         _call_tool_sync(
             meta_srv, "pbi_help", {"tool_name": "get_table_sql"}

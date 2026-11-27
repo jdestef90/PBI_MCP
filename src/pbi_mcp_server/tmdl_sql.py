@@ -20,7 +20,7 @@ from .m_codec import (
     extract_m_sql_target,
     split_clean_sql_segments,
 )
-from .sql_sections import SqlSection, scan_sql_structure, unquote_sql_identifier
+from .sql_sections import SqlSection, SqlStructure, scan_sql_structure, unquote_sql_identifier
 
 _PARTITION_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)partition\s+"
@@ -46,7 +46,9 @@ def _add_line_numbers(text: str) -> str:
     return "\n".join(f"{idx}: {line}" for idx, line in enumerate(text.splitlines(), 1))
 
 
-def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
+def extract_sql_metadata(
+    sql_expression: str, *, structure: SqlStructure | None = None
+) -> dict[str, Any]:
     """Extract projected fields, source tables, and dynamic M parameters from SQL."""
     dynamic_params: list[str] = []
     if "{{m:" in sql_expression:
@@ -58,14 +60,14 @@ def extract_sql_metadata(sql_expression: str) -> dict[str, Any]:
         if param not in dynamic_params:
             dynamic_params.append(param)
 
-    cleaned = _M_PARAM_RE.sub(lambda m: f"{{{{m:{m.group(1)}}}}}", sql_expression)
-    cleaned = cleaned.strip()
-    if cleaned.startswith('""') and cleaned.endswith('""'):
-        cleaned = cleaned[2:-2]
-    elif cleaned.startswith('"') and cleaned.endswith('"'):
-        cleaned = cleaned[1:-1]
-
-    structure = scan_sql_structure(cleaned)
+    if structure is None:
+        cleaned = _M_PARAM_RE.sub(lambda m: f"{{{{m:{m.group(1)}}}}}", sql_expression)
+        cleaned = cleaned.strip()
+        if cleaned.startswith('""') and cleaned.endswith('""'):
+            cleaned = cleaned[2:-2]
+        elif cleaned.startswith('"') and cleaned.endswith('"'):
+            cleaned = cleaned[1:-1]
+        structure = scan_sql_structure(cleaned)
 
     return {
         "selected_fields": list(structure.selected_fields),
@@ -96,13 +98,19 @@ class SqlSource:
     descriptor: MSerializationDescriptor | None = None
     dynamic_parameters: tuple[str, ...] = ()
 
-    def as_dict(self, root: Path | None = None, include_sql: bool = True) -> dict[str, Any]:
+    def as_dict(
+        self,
+        root: Path | None = None,
+        include_sql: bool = True,
+        *,
+        structure: SqlStructure | None = None,
+    ) -> dict[str, Any]:
         if root:
             file_value = str(self.file.relative_to(root)).replace("\\", "/")
         else:
             file_value = str(self.file).replace("\\", "/")
         clean = self.clean_sql or self.sql_expression
-        meta = extract_sql_metadata(clean)
+        meta = extract_sql_metadata(clean, structure=structure)
         if self.dynamic_parameters:
             merged_params = list(self.dynamic_parameters)
             for p in meta["dynamic_parameters"]:
@@ -365,22 +373,47 @@ def list_table_sql_sources(semantic_model_dir: Path) -> list[dict[str, Any]]:
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class _CteSelection:
+    chunks: list[dict[str, Any]]
+    combined_sql: str
+    truncated: bool
+    returned_line_count: int
+    total_requested_lines: int
+    warnings: list[str]
+    next_hints: list[str]
+
+
+def _format_hint_call(
+    table: str | None,
+    partition: str | None,
+    **selector_kwargs: Any,
+) -> str:
+    tbl = table or "<table_name>"
+    parts = [f"table_name={tbl!r}"]
+    if partition is not None:
+        parts.append(f"partition={partition!r}")
+    for key, val in selector_kwargs.items():
+        parts.append(f"{key}={val!r}")
+    return f"get_table_sql({', '.join(parts)})"
+
+
 def _build_outline_hints(
     table: str | None,
     *,
+    partition: str | None = None,
     has_ctes: bool,
     section_names: list[str],
     line_count: int,
 ) -> list[str]:
-    tbl = table or "<table_name>"
     hints: list[str] = []
     if has_ctes and section_names:
         sample = section_names[:2] if len(section_names) >= 2 else section_names
         if "main" in section_names and "main" not in sample:
             sample = [section_names[0], "main"]
-        hints.append(f"get_table_sql(table_name={tbl!r}, ctes={sample!r})")
+        hints.append(_format_hint_call(table, partition, ctes=sample))
     window_end = min(line_count, DEFAULT_LINE_WINDOW) if line_count > 0 else 1
-    hints.append(f"get_table_sql(table_name={tbl!r}, start_line=1, end_line={window_end})")
+    hints.append(_format_hint_call(table, partition, start_line=1, end_line=window_end))
     return hints
 
 
@@ -410,7 +443,8 @@ def _select_cte_sections(
     sections: tuple[SqlSection, ...],
     lines: list[str],
     table: str | None,
-) -> tuple[list[dict[str, Any]], str, bool, int, int, list[str], list[str]]:
+    partition: str | None = None,
+) -> _CteSelection:
     by_cf = {s.name.casefold(): s for s in sections}
     available = [s.name for s in sections]
     missing = [name for name in requested if name.casefold() not in by_cf]
@@ -434,76 +468,87 @@ def _select_cte_sections(
     returned_parts: list[str] = []
     returned_line_count = 0
     truncated = False
-    cont_start: int | None = None
-    cont_end: int | None = None
+    partial_continuation: tuple[int, int] | None = None
+    unreturned_sections: list[SqlSection] = []
 
     for sec in matched:
         sec_lines = lines[sec.start_line - 1 : sec.end_line]
         if remaining <= 0:
             truncated = True
-            if cont_start is None:
-                cont_start = sec.start_line
-            cont_end = sec.end_line if cont_end is None else max(cont_end, sec.end_line)
+            unreturned_sections.append(sec)
             continue
 
-        if len(sec_lines) <= remaining:
-            chunk_sql = "\n".join(sec_lines)
-            selected_chunks.append({
-                "name": sec.name,
-                "kind": sec.kind,
-                "start_line": sec.start_line,
-                "end_line": sec.end_line,
-                "returned_start_line": sec.start_line,
-                "returned_end_line": sec.end_line,
-                "truncated": False,
-                "sql": chunk_sql,
-            })
-            returned_parts.append(chunk_sql)
-            returned_line_count += len(sec_lines)
-            remaining -= len(sec_lines)
-        else:
+        is_partial = len(sec_lines) > remaining
+        kept = sec_lines[:remaining] if is_partial else sec_lines
+        ret_end = sec.start_line + len(kept) - 1
+        chunk_sql = "\n".join(kept)
+        selected_chunks.append({
+            "name": sec.name,
+            "kind": sec.kind,
+            "start_line": sec.start_line,
+            "end_line": sec.end_line,
+            "returned_start_line": sec.start_line,
+            "returned_end_line": ret_end,
+            "truncated": is_partial,
+            "sql": chunk_sql,
+        })
+        returned_parts.append(chunk_sql)
+        returned_line_count += len(kept)
+        remaining -= len(kept)
+        if is_partial:
             truncated = True
-            kept = sec_lines[:remaining]
-            chunk_sql = "\n".join(kept)
-            ret_end = sec.start_line + remaining - 1
-            selected_chunks.append({
-                "name": sec.name,
-                "kind": sec.kind,
-                "start_line": sec.start_line,
-                "end_line": sec.end_line,
-                "returned_start_line": sec.start_line,
-                "returned_end_line": ret_end,
-                "truncated": True,
-                "sql": chunk_sql,
-            })
-            returned_parts.append(chunk_sql)
-            returned_line_count += len(kept)
-            cont_start = ret_end + 1
-            cont_end = sec.end_line
-            remaining = 0
+            partial_continuation = (ret_end + 1, sec.end_line)
 
     warnings: list[str] = []
     next_hints: list[str] = []
-    if truncated and cont_start is not None and cont_end is not None:
-        tbl = table or "<table_name>"
-        window_end = min(cont_end, cont_start + DEFAULT_LINE_WINDOW - 1)
+    if truncated:
         warnings.append(
             f"Requested SQL Sections span {total_requested} lines, exceeding the "
             f"{CTE_MAX_LINES}-line single-call safety ceiling; truncated to "
             f"{returned_line_count} lines."
         )
-        next_hints.append(
-            f"get_table_sql(table_name={tbl!r}, start_line={cont_start}, end_line={window_end})"
-        )
+        if partial_continuation is not None:
+            cont_start, sec_end = partial_continuation
+            window_end = min(sec_end, cont_start + DEFAULT_LINE_WINDOW - 1)
+            next_hints.append(
+                _format_hint_call(
+                    table, partition, start_line=cont_start, end_line=window_end
+                )
+            )
+        if unreturned_sections:
+            # If the next unreturned section is contiguous with a partial continuation,
+            # still give an explicit ctes/line hint for remaining requested sections.
+            if (
+                len(unreturned_sections) == 1
+                and unreturned_sections[0].line_count > CTE_MAX_LINES
+            ):
+                rem_sec = unreturned_sections[0]
+                rem_end = min(rem_sec.end_line, rem_sec.start_line + DEFAULT_LINE_WINDOW - 1)
+                next_hints.append(
+                    _format_hint_call(
+                        table,
+                        partition,
+                        start_line=rem_sec.start_line,
+                        end_line=rem_end,
+                    )
+                )
+            else:
+                next_hints.append(
+                    _format_hint_call(
+                        table,
+                        partition,
+                        ctes=[s.name for s in unreturned_sections],
+                    )
+                )
 
-    return (
-        selected_chunks,
-        "\n".join(returned_parts),
-        truncated,
-        returned_line_count,
-        total_requested,
-        warnings,
-        next_hints,
+    return _CteSelection(
+        chunks=selected_chunks,
+        combined_sql="\n".join(returned_parts),
+        truncated=truncated,
+        returned_line_count=returned_line_count,
+        total_requested_lines=total_requested,
+        warnings=warnings,
+        next_hints=next_hints,
     )
 
 
@@ -513,6 +558,7 @@ def _slice_sql_lines(
     start_line: int | None,
     end_line: int | None,
     table: str | None,
+    partition: str | None = None,
 ) -> tuple[str, int, int, list[str]]:
     line_count = len(lines)
     if start_line is not None and start_line < 1:
@@ -546,11 +592,10 @@ def _slice_sql_lines(
     sliced = "\n".join(lines[eff_start - 1 : eff_end])
     next_hints: list[str] = []
     if eff_end < line_count:
-        tbl = table or "<table_name>"
         next_start = eff_end + 1
         next_end = min(line_count, next_start + DEFAULT_LINE_WINDOW - 1)
         next_hints.append(
-            f"get_table_sql(table_name={tbl!r}, start_line={next_start}, end_line={next_end})"
+            _format_hint_call(table, partition, start_line=next_start, end_line=next_end)
         )
     return sliced, eff_start, eff_end, next_hints
 
@@ -592,6 +637,7 @@ def get_table_sql(
             },
         )
     source = matches[0]
+    hint_partition = source.partition if partition is not None else None
     clean = source.clean_sql or source.sql_expression
     lines = clean.splitlines()
     line_count = len(lines)
@@ -613,31 +659,24 @@ def get_table_sql(
                 code="INVALID_ARGUMENT",
             )
         req_names = _normalize_cte_names(ctes)
-        (
-            selected_chunks,
-            combined_sql,
-            truncated,
-            returned_line_count,
-            total_requested,
-            warnings,
-            next_hints,
-        ) = _select_cte_sections(
+        selection = _select_cte_sections(
             requested=req_names,
             sections=structure.sections,
             lines=lines,
             table=source.table,
+            partition=hint_partition,
         )
-        base = source.as_dict(semantic_model_dir, include_sql=False)
+        base = source.as_dict(semantic_model_dir, include_sql=False, structure=structure)
         base["view"] = "ctes"
-        base["sql"] = combined_sql
+        base["sql"] = selection.combined_sql
         base["sections"] = sections_dicts
         base["clauses"] = clauses_dicts
-        base["selected_sections"] = selected_chunks
-        base["truncated"] = truncated
-        base["returned_line_count"] = returned_line_count
-        base["total_requested_lines"] = total_requested
-        base["warnings"] = warnings
-        base["next_hints"] = next_hints
+        base["selected_sections"] = selection.chunks
+        base["truncated"] = selection.truncated
+        base["returned_line_count"] = selection.returned_line_count
+        base["total_requested_lines"] = selection.total_requested_lines
+        base["warnings"] = selection.warnings
+        base["next_hints"] = selection.next_hints
         return base
 
     if not include_full_sql and has_line_range:
@@ -651,8 +690,9 @@ def get_table_sql(
             start_line=start_line,
             end_line=end_line,
             table=source.table,
+            partition=hint_partition,
         )
-        base = source.as_dict(semantic_model_dir, include_sql=False)
+        base = source.as_dict(semantic_model_dir, include_sql=False, structure=structure)
         base["view"] = "lines"
         base["sql"] = sliced_sql
         base["start_line"] = eff_start
@@ -667,7 +707,7 @@ def get_table_sql(
         not include_full_sql and (outline or line_count > OUTLINE_LINE_THRESHOLD)
     )
     if show_outline:
-        base = source.as_dict(semantic_model_dir, include_sql=False)
+        base = source.as_dict(semantic_model_dir, include_sql=False, structure=structure)
         base["view"] = "outline"
         base["sql"] = None
         base["sections"] = sections_dicts
@@ -675,13 +715,14 @@ def get_table_sql(
         base["warnings"] = []
         base["next_hints"] = _build_outline_hints(
             source.table,
+            partition=hint_partition,
             has_ctes=structure.has_ctes,
             section_names=[s.name for s in structure.sections],
             line_count=line_count,
         )
         return base
 
-    full_res = source.as_dict(semantic_model_dir, include_sql=True)
+    full_res = source.as_dict(semantic_model_dir, include_sql=True, structure=structure)
     full_res["view"] = "full"
     full_res["sections"] = sections_dicts
     full_res["clauses"] = clauses_dicts
