@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -600,6 +601,315 @@ def _slice_sql_lines(
     return sliced, eff_start, eff_end, next_hints
 
 
+def _build_line_starts(text: str) -> list[int]:
+    starts = [0]
+    pos = text.find("\n")
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = text.find("\n", pos + 1)
+    return starts
+
+
+def _line_of_offset(line_starts: list[int], offset: int) -> int:
+    if offset <= 0:
+        return 1
+    return bisect_right(line_starts, offset)
+
+
+def _find_enclosing_section(
+    sections: tuple[SqlSection, ...], offset: int, line_num: int
+) -> SqlSection | None:
+    for sec in sections:
+        if sec.outer_span[0] <= offset < sec.outer_span[1]:
+            return sec
+    covering = [s for s in sections if s.start_line <= line_num <= s.end_line]
+    if len(covering) == 1:
+        return covering[0]
+    if len(covering) > 1:
+        if offset < covering[0].outer_span[0]:
+            return covering[0]
+        candidate: SqlSection | None = None
+        for sec in covering:
+            if sec.outer_span[0] <= offset:
+                candidate = sec
+        return candidate
+    return None
+
+
+def _search_table_sql_view(
+    semantic_model_dir: Path,
+    *,
+    search: str,
+    table: str | None = None,
+    partition: str | None = None,
+    relative_file: str | None = None,
+    ctes: list[str] | str | None = None,
+    context_lines: int = 2,
+) -> dict[str, Any]:
+    if not isinstance(search, str) or not search.strip():
+        raise InvalidArgumentError("search must be a non-empty string.", code="INVALID_ARGUMENT")
+    if isinstance(context_lines, bool) or context_lines < 0:
+        raise InvalidArgumentError(
+            f"context_lines must be >= 0 (received {context_lines}).",
+            code="INVALID_ARGUMENT",
+        )
+
+    sources = _select_sources(
+        semantic_model_dir,
+        table=table,
+        partition=partition,
+        relative_file=relative_file,
+    )
+    has_explicit_target = (
+        table is not None or partition is not None or relative_file is not None
+    )
+    if has_explicit_target and not sources:
+        raise ObjectNotFoundError(
+            "No Partition SQL source matched the supplied table, partition, or file selector.",
+            code="OBJECT_NOT_FOUND",
+            details={"table": table, "partition": partition, "relative_file": relative_file},
+        )
+
+    requested_ctes: list[str] | None = None
+    if ctes is not None:
+        requested_ctes = _normalize_cte_names(ctes)
+        if not sources:
+            raise ObjectNotFoundError(
+                "No Partition SQL source matched the supplied table, partition, or file selector.",
+                code="OBJECT_NOT_FOUND",
+                details={"table": table, "partition": partition, "relative_file": relative_file},
+            )
+        if len(sources) > 1:
+            if not has_explicit_target:
+                raise InvalidArgumentError(
+                    "Specify table_name when scoping search by ctes.",
+                    code="INVALID_ARGUMENT",
+                )
+            raise AmbiguousObjectError(
+                "The selector matched multiple SQL sources. "
+                "Supply partition when scoping search by ctes.",
+                code="AMBIGUOUS_OBJECT",
+                details={
+                    "candidates": [
+                        {"table": m.table, "partition": m.partition, "file": str(m.file)}
+                        for m in sources
+                    ]
+                },
+            )
+
+    search_norm = search.replace("\r\n", "\n").replace("\r", "\n")
+    compiled = re.compile(re.escape(search_norm), re.IGNORECASE)
+
+    source_results: list[dict[str, Any]] = []
+    total_matched_lines = 0
+    total_occurrences = 0
+    resolved_ctes: list[str] | None = None
+
+    for source in sources:
+        clean = source.clean_sql or source.sql_expression
+        lines = clean.splitlines()
+        line_count = len(lines)
+        structure = scan_sql_structure(clean)
+        line_starts = _build_line_starts(clean)
+
+        allowed_sections_by_cf: dict[str, SqlSection] | None = None
+        if requested_ctes is not None:
+            by_cf = {s.name.casefold(): s for s in structure.sections}
+            available = [s.name for s in structure.sections]
+            missing = [name for name in requested_ctes if name.casefold() not in by_cf]
+            if missing:
+                avail_str = ", ".join(available) if available else "(none)"
+                raise ObjectNotFoundError(
+                    f"Unknown SQL Section(s): {', '.join(missing)}. "
+                    f"Available SQL Sections: {avail_str}.",
+                    code="OBJECT_NOT_FOUND",
+                    details={
+                        "requested": requested_ctes,
+                        "missing": missing,
+                        "available_sections": available,
+                    },
+                )
+            allowed_sections_by_cf = {
+                name.casefold(): by_cf[name.casefold()] for name in requested_ctes
+            }
+            resolved_ctes = [by_cf[name.casefold()].name for name in requested_ctes]
+
+        if line_count == 0:
+            continue
+
+        # Collect matched (line_num, section) entries in document order
+        matched_entries: list[tuple[int, SqlSection | None]] = []
+        seen_line_sec: set[tuple[int, str | None]] = set()
+        source_occurrences = 0
+
+        for match in compiled.finditer(clean):
+            m_start = match.start()
+            m_end_pos = max(m_start, match.end() - 1)
+            start_ln = _line_of_offset(line_starts, m_start)
+            end_ln = _line_of_offset(line_starts, m_end_pos)
+            start_sec = _find_enclosing_section(structure.sections, m_start, start_ln)
+            end_sec = _find_enclosing_section(structure.sections, m_end_pos, end_ln)
+
+            if allowed_sections_by_cf is not None and (
+                start_sec is None
+                or start_sec.name.casefold() not in allowed_sections_by_cf
+                or end_sec is None
+                or end_sec.name.casefold() not in allowed_sections_by_cf
+            ):
+                continue
+
+            source_occurrences += 1
+            for ln in range(start_ln, end_ln + 1):
+                if ln == start_ln:
+                    ln_sec = start_sec
+                elif ln == end_ln:
+                    ln_sec = end_sec
+                else:
+                    ln_sec = _find_enclosing_section(structure.sections, line_starts[ln - 1], ln)
+                sec_name = ln_sec.name if ln_sec is not None else None
+                key = (ln, sec_name)
+                if key not in seen_line_sec:
+                    seen_line_sec.add(key)
+                    matched_entries.append((ln, ln_sec))
+
+        if not matched_entries:
+            continue
+
+        # Build context windows and merge overlapping/contiguous windows
+        raw_windows: list[tuple[int, int]] = []
+        for ln, ln_sec in matched_entries:
+            if allowed_sections_by_cf is not None and ln_sec is not None:
+                w_start = max(ln_sec.start_line, ln - context_lines)
+                w_end = min(ln_sec.end_line, ln + context_lines)
+            else:
+                w_start = max(1, ln - context_lines)
+                w_end = min(line_count, ln + context_lines)
+            raw_windows.append((w_start, w_end))
+
+        raw_windows.sort()
+        merged_windows: list[tuple[int, int]] = []
+        for w_start, w_end in raw_windows:
+            if merged_windows and w_start <= merged_windows[-1][1] + 1:
+                prev_start, prev_end = merged_windows[-1]
+                merged_windows[-1] = (prev_start, max(prev_end, w_end))
+            else:
+                merged_windows.append((w_start, w_end))
+
+        # Map line -> list of matched section names
+        matched_line_sections: dict[int, list[str | None]] = {}
+        for ln, ln_sec in matched_entries:
+            matched_line_sections.setdefault(ln, []).append(
+                ln_sec.name if ln_sec is not None else None
+            )
+
+        hunks: list[dict[str, Any]] = []
+        for h_start, h_end in merged_windows:
+            hunk_match_entries = [
+                (ln, ln_sec.name if ln_sec is not None else None)
+                for ln, ln_sec in matched_entries
+                if h_start <= ln <= h_end
+            ]
+            hunk_sections: list[str] = []
+            hunk_match_lines: list[int] = []
+            for ln, sec_name in hunk_match_entries:
+                if sec_name is not None and sec_name not in hunk_sections:
+                    hunk_sections.append(sec_name)
+                if ln not in hunk_match_lines:
+                    hunk_match_lines.append(ln)
+
+            hunk_lines: list[dict[str, Any]] = []
+            hunk_match_set = set(hunk_match_lines)
+            for cur_ln in range(h_start, h_end + 1):
+                if cur_ln in matched_line_sections:
+                    line_sec_name = matched_line_sections[cur_ln][0]
+                else:
+                    covering = [
+                        s for s in structure.sections if s.start_line <= cur_ln <= s.end_line
+                    ]
+                    line_sec_name = covering[0].name if len(covering) == 1 else None
+                hunk_lines.append({
+                    "line": cur_ln,
+                    "text": lines[cur_ln - 1],
+                    "is_match": cur_ln in hunk_match_set,
+                    "section": line_sec_name,
+                })
+
+            hunks.append({
+                "start_line": h_start,
+                "end_line": h_end,
+                "sections": hunk_sections,
+                "match_lines": hunk_match_lines,
+                "match_sections": [
+                    {"line": ln, "section": sec_name} for ln, sec_name in hunk_match_entries
+                ],
+                "lines": hunk_lines,
+            })
+
+        try:
+            rel_file = str(source.file.relative_to(semantic_model_dir)).replace("\\", "/")
+        except ValueError:
+            rel_file = str(source.file).replace("\\", "/")
+        sql_hash = source.sql_hash or compute_sql_hash(clean)
+
+        unique_matched_line_count = len(matched_line_sections)
+        total_matched_lines += unique_matched_line_count
+        total_occurrences += source_occurrences
+
+        source_results.append({
+            "table": source.table,
+            "partition": source.partition,
+            "file": rel_file,
+            "mode": source.mode,
+            "connector": source.connector,
+            "line_count": line_count,
+            "sql_hash": sql_hash,
+            "match_count": unique_matched_line_count,
+            "matches": [
+                {
+                    "line": ln,
+                    "section": ln_sec.name if ln_sec is not None else None,
+                    "text": lines[ln - 1],
+                }
+                for ln, ln_sec in matched_entries
+            ],
+            "hunks": hunks,
+        })
+
+    if resolved_ctes is not None:
+        scope = "ctes"
+    elif partition is not None:
+        scope = "partition"
+    elif table is not None:
+        scope = "table"
+    else:
+        scope = "workspace"
+
+    resolved_table = (
+        sources[0].table if table is not None and len(sources) >= 1 and sources[0].table else table
+    )
+    resolved_partition = (
+        sources[0].partition
+        if partition is not None and len(sources) >= 1
+        else partition
+    )
+
+    return {
+        "view": "search",
+        "search": search,
+        "scope": scope,
+        "table": resolved_table,
+        "partition": resolved_partition,
+        "ctes": resolved_ctes,
+        "context_lines": context_lines,
+        "case_sensitive": False,
+        "sources_searched": len(sources),
+        "matched_sources": len(source_results),
+        "total_matches": total_matched_lines,
+        "total_occurrences": total_occurrences,
+        "results": source_results,
+    }
+
+
 def get_table_sql(
     semantic_model_dir: Path,
     *,
@@ -610,8 +920,31 @@ def get_table_sql(
     ctes: list[str] | str | None = None,
     start_line: int | None = None,
     end_line: int | None = None,
+    search: str | None = None,
+    context_lines: int = 2,
     include_full_sql: bool = False,
 ) -> dict[str, Any]:
+    if not include_full_sql and search is not None:
+        if outline:
+            raise InvalidArgumentError(
+                "Cannot combine search with outline=True.",
+                code="INVALID_ARGUMENT",
+            )
+        if start_line is not None or end_line is not None:
+            raise InvalidArgumentError(
+                "Cannot combine search with start_line/end_line.",
+                code="INVALID_ARGUMENT",
+            )
+        return _search_table_sql_view(
+            semantic_model_dir,
+            search=search,
+            table=table,
+            partition=partition,
+            relative_file=relative_file,
+            ctes=ctes,
+            context_lines=context_lines,
+        )
+
     matches = _select_sources(
         semantic_model_dir,
         table=table,

@@ -320,6 +320,8 @@ class PbipService:
         ctes: list[str] | str | None = None,
         start_line: int | None = None,
         end_line: int | None = None,
+        search: str | None = None,
+        context_lines: int = 2,
     ) -> dict[str, Any]:
         if not self.info.semantic_model_dir:
             raise ObjectNotFoundError("Semantic model directory was not found.")
@@ -331,6 +333,8 @@ class PbipService:
             ctes=ctes,
             start_line=start_line,
             end_line=end_line,
+            search=search,
+            context_lines=context_lines,
         )
 
     def update_table_sql(
