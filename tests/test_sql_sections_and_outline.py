@@ -613,7 +613,7 @@ def test_get_table_multi_partition_summary_and_edge_case_sql_syntax(tmp_path: Pa
         "\t\tsource =\n"
         "\t\t\tlet\n"
         '\t\t\t    Source = Value.NativeQuery(Sql.Database("srv", "db"), '
-        '"SELECT yr FROM dbo.orders_archive")\n'
+        '"SELECT yr FROM " & Catalog & ".dbo.orders_archive")\n'
         "\t\t\tin\n"
         "\t\t\t    Source\n"
     )
@@ -622,7 +622,7 @@ def test_get_table_multi_partition_summary_and_edge_case_sql_syntax(tmp_path: Pa
     direct_srv = create_server(PbipService(pbip))
     meta_srv = create_server(PbipService(pbip), meta_tools=True)
 
-    # 1. Multi-partition get_table summary has SQL Section names/counts and no SQL bodies
+    # 1. Multi-partition get_table summary has sections, source_tables, dynamic_parameters, no SQL
     tbl = json.loads(
         _call_tool_sync(direct_srv, "get_table", {"table_name": "MultiCteTable"}).content[0].text
     )
@@ -632,7 +632,17 @@ def test_get_table_multi_partition_summary_and_edge_case_sql_syntax(tmp_path: Pa
         "PartArchive": ["main"],
     }
     assert sql_src["sql_section_counts"] == {"PartRecent": 2, "PartArchive": 1}
-    assert "EXTRACT(YEAR" not in json.dumps(tbl)
+    assert sql_src["source_tables"] == {
+        "PartRecent": ["dbo.orders"],
+        "PartArchive": ["{{m:Catalog}}.dbo.orders_archive"],
+    }
+    assert sql_src["dynamic_parameters"] == {
+        "PartRecent": [],
+        "PartArchive": ["Catalog"],
+    }
+    serialized_tbl = json.dumps(tbl)
+    assert "EXTRACT(YEAR" not in serialized_tbl
+    assert "SELECT yr FROM" not in serialized_tbl
 
     # 2. Single-line CTE + EXTRACT(YEAR FROM o.dt) doesn't treat `o.dt` as a source table
     recent_json = json.loads(

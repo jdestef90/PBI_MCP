@@ -44,6 +44,22 @@ OffsetArg = Annotated[
 ]
 
 
+def _normalize_output_format(format_value: Any) -> Literal["text", "json"]:
+    """Validate and normalize output format for plain-text/JSON MCP SQL tools."""
+    if format_value is None:
+        return "text"
+    if isinstance(format_value, str):
+        fmt = format_value.strip().lower()
+        if fmt == "text":
+            return "text"
+        if fmt == "json":
+            return "json"
+    raise InvalidArgumentError(
+        f"Unsupported format {format_value!r}; expected 'text' or 'json'.",
+        code="INVALID_ARGUMENT",
+    )
+
+
 def _build_server_and_tools(
     backend: Backend, *, meta_tools: bool = False
 ) -> tuple[MCPServer, dict[str, Callable[..., Any]]]:
@@ -256,17 +272,7 @@ def _build_server_and_tools(
         workspace: WorkspaceArg = None,
     ) -> str | dict[str, Any]:
         """Extract or search Partition SQL (Clean SQL View or outline) across workspace, table, or SQL Sections."""  # noqa: E501
-        if format is None:
-            fmt = "text"
-        elif isinstance(format, str):
-            fmt = format.strip().lower()
-        else:
-            fmt = ""
-        if fmt not in {"text", "json"}:
-            raise InvalidArgumentError(
-                f"Unsupported format {format!r}; expected 'text' or 'json'.",
-                code="INVALID_ARGUMENT",
-            )
+        fmt = _normalize_output_format(format)
         data = get_service(workspace).get_table_sql(
             table_name=table_name,
             partition=partition,
@@ -518,17 +524,7 @@ def _build_server_and_tools(
         dry_run: DryRunArg = True,
     ) -> str | dict[str, Any]:
         """Safely edit a table's Partition SQL against the Clean SQL View with diff preview."""
-        if format is None:
-            fmt = "text"
-        elif isinstance(format, str):
-            fmt = format.strip().lower()
-        else:
-            fmt = ""
-        if fmt not in {"text", "json"}:
-            raise InvalidArgumentError(
-                f"Unsupported format {format!r}; expected 'text' or 'json'.",
-                code="INVALID_ARGUMENT",
-            )
+        fmt = _normalize_output_format(format)
         plan = get_service(workspace).update_table_sql(
             old_text,
             new_text,
