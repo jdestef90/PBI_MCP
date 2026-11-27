@@ -176,6 +176,11 @@ class DependencyGraph:
             p_name = str(part.get("partition") or "")
             t_cf = t_name.casefold()
             part_id = f"{self.ws_id}::partition::{t_name}.{p_name}"
+            part_meta = {
+                "source_type": part.get("source_type"),
+                "source_tables": part.get("source_tables", []),
+                "sql_fields": part.get("sql_fields", []),
+            }
             part_node = self._add_node(
                 GraphNode(
                     object_id=part_id,
@@ -185,13 +190,10 @@ class DependencyGraph:
                     table=t_name,
                     file=part.get("file"),
                     line=part.get("sql_start_line"),
-                    metadata={
-                        "source_type": part.get("source_type"),
-                        "source_tables": part.get("source_tables", []),
-                        "sql_fields": part.get("sql_fields", []),
-                    },
+                    metadata=part_meta,
                 )
             )
+            part_node.metadata.update(part_meta)
             if t_cf in tables_by_cf:
                 self._add_edge(part_node.object_id, tables_by_cf[t_cf].object_id)
 

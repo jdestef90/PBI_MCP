@@ -225,6 +225,10 @@ class PbipService:
                     "partitions": [s["partition"] for s in summaries],
                     "sql_hashes": {s["partition"]: s["sql_hash"] for s in summaries},
                     "line_counts": {s["partition"]: s["line_count"] for s in summaries},
+                    "sql_sections": {s["partition"]: s["sql_sections"] for s in summaries},
+                    "sql_section_counts": {
+                        s["partition"]: s["sql_section_count"] for s in summaries
+                    },
                 }
         return schema
 
@@ -311,6 +315,11 @@ class PbipService:
         self,
         table_name: str | None = None,
         partition: str | None = None,
+        *,
+        outline: bool = False,
+        ctes: list[str] | str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
     ) -> dict[str, Any]:
         if not self.info.semantic_model_dir:
             raise ObjectNotFoundError("Semantic model directory was not found.")
@@ -318,6 +327,10 @@ class PbipService:
             self.info.semantic_model_dir,
             table=table_name,
             partition=partition,
+            outline=outline,
+            ctes=ctes,
+            start_line=start_line,
+            end_line=end_line,
         )
 
     def update_table_sql(
@@ -338,6 +351,7 @@ class PbipService:
             self.info.semantic_model_dir,
             table=table_name,
             partition=partition,
+            include_full_sql=True,
         )
         target_path = (self.info.semantic_model_dir / sql_before["file"]).resolve()
         original_file_text = target_path.read_text(encoding="utf-8-sig")

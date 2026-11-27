@@ -189,6 +189,42 @@ def _build_server_and_tools(
                 description="Optional partition name if the table has multiple SQL partitions."
             ),
         ] = None,
+        outline: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When true, return only the structural outline (SQL Sections or clause "
+                    "landmarks) without SQL body for any query size."
+                )
+            ),
+        ] = False,
+        ctes: Annotated[
+            list[str] | str | None,
+            Field(
+                description=(
+                    "Optional SQL Section name or list of names (case-insensitive, supports "
+                    "'main') to read with canonical 1-based line numbers (400-line ceiling)."
+                )
+            ),
+        ] = None,
+        start_line: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional inclusive 1-based start line (defaults to a 120-line window "
+                    "when end_line is omitted)."
+                )
+            ),
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional inclusive 1-based end line (starts at line 1 when start_line "
+                    "is omitted)."
+                )
+            ),
+        ] = None,
         format: Annotated[
             Literal["text", "json"],
             Field(
@@ -199,7 +235,7 @@ def _build_server_and_tools(
         ] = "text",
         workspace: WorkspaceArg = None,
     ) -> str | dict[str, Any]:
-        """Extract Partition SQL (Clean SQL View with line numbers) for a table."""
+        """Extract Partition SQL (Clean SQL View or outline) for a table."""
         if format is None:
             fmt = "text"
         elif isinstance(format, str):
@@ -212,7 +248,12 @@ def _build_server_and_tools(
                 code="INVALID_ARGUMENT",
             )
         data = get_service(workspace).get_table_sql(
-            table_name=table_name, partition=partition
+            table_name=table_name,
+            partition=partition,
+            outline=outline,
+            ctes=ctes,
+            start_line=start_line,
+            end_line=end_line,
         )
         if fmt == "json":
             return format_get_table_sql_json(data)

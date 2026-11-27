@@ -42,14 +42,59 @@ def compute_sql_hash(clean_sql: str) -> str:
     return hashlib.sha256(clean_sql.encode("utf-8")).hexdigest()[:12]
 
 
-def format_numbered_sql(clean_sql: str, *, start_line: int = 1) -> str:
+def format_numbered_sql(
+    clean_sql: str, *, start_line: int = 1, width: int | None = None
+) -> str:
     """Format SQL with right-aligned canonical 1-based line numbers (`42 | ...`)."""
     lines = clean_sql.splitlines()
     if not lines:
         return ""
     max_line = start_line + len(lines) - 1
-    width = len(str(max_line))
-    return "\n".join(f"{idx:>{width}} | {line}" for idx, line in enumerate(lines, start_line))
+    pad = width if width is not None else len(str(max_line))
+    return "\n".join(f"{idx:>{pad}} | {line}" for idx, line in enumerate(lines, start_line))
+
+
+def _format_outline_body(data: dict[str, Any]) -> list[str]:
+    has_ctes = bool(data.get("has_ctes"))
+    sections: list[dict[str, Any]] = list(data.get("sections") or [])
+    clauses: list[dict[str, Any]] = list(data.get("clauses") or [])
+    out: list[str] = []
+
+    if has_ctes and sections:
+        out.append(f"SQL Sections ({len(sections)}):")
+        for sec in sections:
+            name = sec.get("name", "")
+            kind = sec.get("kind", "cte")
+            s_ln = sec.get("start_line", 1)
+            e_ln = sec.get("end_line", s_ln)
+            cnt = sec.get("line_count", e_ln - s_ln + 1)
+            parts = [f"- {name} ({kind}): lines {s_ln}-{e_ln} ({cnt} lines)"]
+            refs = list(sec.get("references_ctes") or [])
+            if refs:
+                parts.append("refs: " + ", ".join(refs))
+            srcs = list(sec.get("source_tables") or [])
+            if srcs:
+                parts.append("sources: " + ", ".join(srcs))
+            out.append(" | ".join(parts))
+    elif clauses:
+        out.append(f"SQL Clause Landmarks ({len(clauses)}):")
+        for cl in clauses:
+            name = cl.get("clause", "")
+            s_ln = cl.get("start_line", 1)
+            e_ln = cl.get("end_line", s_ln)
+            cnt = cl.get("line_count", e_ln - s_ln + 1)
+            out.append(f"- {name}: lines {s_ln}-{e_ln} ({cnt} lines)")
+    elif sections:
+        out.append(f"SQL Sections ({len(sections)}):")
+        for sec in sections:
+            s_ln = sec.get("start_line", 1)
+            e_ln = sec.get("end_line", s_ln)
+            cnt = sec.get("line_count", e_ln - s_ln + 1)
+            sec_name = sec.get("name", "main")
+            sec_kind = sec.get("kind", "main")
+            out.append(f"- {sec_name} ({sec_kind}): lines {s_ln}-{e_ln} ({cnt} lines)")
+
+    return out
 
 
 def format_get_table_sql_text(data: dict[str, Any]) -> str:
@@ -64,7 +109,9 @@ def format_get_table_sql_text(data: dict[str, Any]) -> str:
     meta = data.get("sql_metadata") or {}
     dyn_params: list[str] = list(meta.get("dynamic_parameters") or [])
     src_tables: list[str] = list(meta.get("source_tables") or [])
-    clean_sql: str = data.get("sql", "")
+    view = data.get("view") or "full"
+    warnings: list[str] = list(data.get("warnings") or [])
+    next_hints: list[str] = list(data.get("next_hints") or [])
 
     header = [
         f"Table: {table}",
@@ -76,16 +123,59 @@ def format_get_table_sql_text(data: dict[str, Any]) -> str:
     if src_tables:
         header.append("Source Tables: " + ", ".join(src_tables))
 
-    numbered = format_numbered_sql(clean_sql)
-    if numbered:
-        return "\n".join(header) + "\n\n" + numbered
-    return "\n".join(header)
+    blocks: list[str] = ["\n".join(header)]
+
+    if view == "outline":
+        outline_lines = _format_outline_body(data)
+        if outline_lines:
+            blocks.append("\n".join(outline_lines))
+    elif view == "ctes":
+        selected_sections: list[dict[str, Any]] = list(data.get("selected_sections") or [])
+        if selected_sections:
+            max_ln = max(int(s.get("returned_end_line", 1)) for s in selected_sections)
+            pad = len(str(max_ln))
+            for sec in selected_sections:
+                s_ret = int(sec.get("returned_start_line", 1))
+                e_ret = int(sec.get("returned_end_line", s_ret))
+                s_orig = int(sec.get("start_line", s_ret))
+                e_orig = int(sec.get("end_line", e_ret))
+                range_desc = (
+                    f"lines {s_ret}-{e_ret} of {s_orig}-{e_orig}"
+                    if sec.get("truncated")
+                    else f"lines {s_ret}-{e_ret}"
+                )
+                banner = (
+                    f"-- SQL Section: {sec.get('name', '')} "
+                    f"({sec.get('kind', 'cte')}, {range_desc})"
+                )
+                body = format_numbered_sql(sec.get("sql") or "", start_line=s_ret, width=pad)
+                blocks.append(f"{banner}\n{body}" if body else banner)
+    elif view == "lines":
+        clean_sql = data.get("sql") or ""
+        s_ln = int(data.get("start_line", 1))
+        e_ln = int(data.get("end_line", s_ln))
+        banner = f"-- Lines {s_ln}-{e_ln} of {line_count}"
+        numbered = format_numbered_sql(clean_sql, start_line=s_ln)
+        blocks.append(f"{banner}\n{numbered}" if numbered else banner)
+    else:
+        clean_sql = data.get("sql") or ""
+        numbered = format_numbered_sql(clean_sql)
+        if numbered:
+            blocks.append(numbered)
+
+    if warnings:
+        blocks.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
+    if next_hints:
+        blocks.append("Next:\n" + "\n".join(f"- {h}" for h in next_hints))
+
+    return "\n\n".join(blocks)
 
 
 def format_get_table_sql_json(data: dict[str, Any]) -> dict[str, Any]:
     """Return a lean structured dict for MCP get_table_sql(..., format='json')."""
     meta = data.get("sql_metadata") or {}
-    return {
+    view = data.get("view") or "full"
+    out: dict[str, Any] = {
         "table": data.get("table"),
         "partition": data.get("partition"),
         "file": data.get("file"),
@@ -93,11 +183,26 @@ def format_get_table_sql_json(data: dict[str, Any]) -> dict[str, Any]:
         "connector": data.get("connector"),
         "line_count": data.get("line_count", 0),
         "sql_hash": data.get("sql_hash", ""),
+        "view": view,
+        "has_ctes": bool(data.get("has_ctes", False)),
         "dynamic_parameters": list(meta.get("dynamic_parameters") or []),
         "source_tables": list(meta.get("source_tables") or []),
         "selected_fields": list(meta.get("selected_fields") or []),
-        "sql": data.get("sql", ""),
+        "sections": list(data.get("sections") or []),
+        "clauses": list(data.get("clauses") or []),
+        "sql": data.get("sql"),
+        "warnings": list(data.get("warnings") or []),
+        "next_hints": list(data.get("next_hints") or []),
     }
+    if view == "ctes":
+        out["selected_sections"] = list(data.get("selected_sections") or [])
+        out["truncated"] = bool(data.get("truncated", False))
+        out["returned_line_count"] = int(data.get("returned_line_count", 0))
+        out["total_requested_lines"] = int(data.get("total_requested_lines", 0))
+    elif view == "lines":
+        out["start_line"] = int(data.get("start_line", 1))
+        out["end_line"] = int(data.get("end_line", 0))
+    return out
 
 
 def _skip_ws_and_comments(text: str, i: int, limit: int | None = None) -> int:
