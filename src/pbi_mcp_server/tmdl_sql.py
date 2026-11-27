@@ -20,6 +20,15 @@ from .m_codec import (
     extract_m_sql_target,
     split_clean_sql_segments,
 )
+from .sql_edit import (
+    apply_line_range_edit,
+    apply_text_edit,
+    detect_dynamic_param_warnings,
+    strip_line_number_prefixes,
+    validate_clean_sql_delimiters,
+    validate_m_reencoding,
+    verify_sql_hash_precondition,
+)
 from .sql_sections import SqlSection, SqlStructure, scan_sql_structure, unquote_sql_identifier
 
 _PARTITION_RE = re.compile(
@@ -765,18 +774,35 @@ def search_table_sql(
 
 def update_table_sql(
     semantic_model_dir: Path,
-    old_text: str,
-    new_text: str,
+    old_text: str | None = None,
+    new_text: str | None = None,
     *,
     table: str | None = None,
     partition: str | None = None,
     relative_file: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
     expected_replacements: int | None = None,
+    expected_sql_hash: str | None = None,
     dry_run: bool = True,
     create_backups: bool = True,
 ) -> dict[str, Any]:
-    if not old_text:
+    has_line_range = start_line is not None or end_line is not None
+    if old_text is not None and has_line_range:
+        raise InvalidArgumentError(
+            "Cannot combine old_text with start_line/end_line; choose one edit target mode.",
+            code="INVALID_ARGUMENT",
+        )
+    if old_text is None and not has_line_range:
+        raise InvalidArgumentError(
+            "Provide either old_text or start_line/end_line to target a SQL edit.",
+            code="INVALID_ARGUMENT",
+        )
+    if new_text is None:
+        raise InvalidArgumentError("new_text is required.", code="INVALID_ARGUMENT")
+    if not has_line_range and not old_text:
         raise InvalidArgumentError("old_text must not be empty.", code="INVALID_ARGUMENT")
+
     sources = _select_sources(
         semantic_model_dir,
         table=table,
@@ -789,28 +815,88 @@ def update_table_sql(
             code="OBJECT_NOT_FOUND",
             details={"table": table, "partition": partition, "relative_file": relative_file},
         )
+    if (has_line_range or expected_sql_hash is not None) and len(sources) > 1:
+        raise AmbiguousObjectError(
+            "Targeted Partition SQL edits require a single unambiguous source. "
+            "Supply an exact table and/or partition.",
+            code="AMBIGUOUS_OBJECT",
+            details={
+                "candidates": [
+                    {"table": m.table, "partition": m.partition, "file": str(m.file)}
+                    for m in sources
+                ]
+            },
+        )
+    if expected_sql_hash is not None:
+        target_src = sources[0]
+        actual_hash = target_src.sql_hash or compute_sql_hash(
+            target_src.clean_sql or target_src.sql_expression
+        )
+        verify_sql_hash_precondition(actual_hash, expected_sql_hash)
+
     changes = []
+    warnings: list[str] = []
     total = 0
     per_file: dict[Path, list[tuple[SqlSource, str, str]]] = {}
+    last_before_clean: str | None = None
     last_updated_clean: str | None = None
     last_updated_m: str | None = None
     for source in sources:
         clean = source.clean_sql or source.sql_expression
-        count = clean.count(old_text)
-        if count:
-            updated_clean = clean.replace(old_text, new_text)
-            updated_m = (
-                encode_sql_to_m(updated_clean, source.descriptor)
-                if source.descriptor is not None
-                else updated_clean
+        if has_line_range:
+            eff_new, _ = strip_line_number_prefixes(new_text)
+            updated_clean, count = apply_line_range_edit(
+                clean,
+                start_line=start_line,
+                end_line=end_line,
+                new_text=eff_new,
             )
-        else:
-            count = source.sql_expression.count(old_text)
             if not count:
                 continue
-            updated_m = source.sql_expression.replace(old_text, new_text)
-            updated_clean = updated_m
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            eff_end = start_line if end_line is None else end_line
+            reason = f"replace lines {start_line}-{eff_end} in partition {source.partition!r}"
+        else:
+            assert old_text is not None
+            eff_old, old_stripped = strip_line_number_prefixes(old_text, reference_sql=clean)
+            eff_new, _ = strip_line_number_prefixes(
+                new_text,
+                reference_sql=None if old_stripped else clean,
+            )
+            updated_clean, count, match_mode = apply_text_edit(
+                clean,
+                old_text=eff_old,
+                new_text=eff_new,
+                expected_replacements=expected_replacements,
+            )
+            if count:
+                validate_clean_sql_delimiters(updated_clean)
+                if source.descriptor is not None:
+                    updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                    validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+                else:
+                    updated_m = updated_clean
+                warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            else:
+                count = source.sql_expression.count(eff_old)
+                if not count:
+                    continue
+                updated_m = source.sql_expression.replace(eff_old, eff_new)
+                updated_clean = updated_m
+            reason = (
+                f"replace SQL fragment ({match_mode}) in partition {source.partition!r}"
+                if match_mode == "whitespace_normalized"
+                else f"replace SQL fragment in partition {source.partition!r}"
+            )
+
         total += count
+        last_before_clean = clean
         last_updated_clean = updated_clean
         last_updated_m = updated_m
         per_file.setdefault(source.file, []).append((source, source.sql_expression, updated_m))
@@ -819,7 +905,7 @@ def update_table_sql(
             "replacements": count,
             "old_text": old_text,
             "new_text": new_text,
-            "reason": f"replace SQL fragment in partition {source.partition!r}",
+            "reason": reason,
         })
     if expected_replacements is not None and total != expected_replacements:
         raise PreconditionFailedError(
@@ -829,6 +915,8 @@ def update_table_sql(
             details={"expected_replacements": expected_replacements, "actual_replacements": total},
         )
     if total == 0:
+        first_src = sources[0]
+        first_clean = first_src.clean_sql or first_src.sql_expression
         return {
             "operation": "update TMDL Value.NativeQuery SQL",
             "status": "no_op",
@@ -838,6 +926,8 @@ def update_table_sql(
             "changed_files": [],
             "warnings": ["No exact old_text matches were found inside isolated SQL sources."],
             "rolled_back": False,
+            "sql_hash_before": first_src.sql_hash or compute_sql_hash(first_clean),
+            "sql_hash_after": first_src.sql_hash or compute_sql_hash(first_clean),
         }
     plan: dict[str, Any] = {
         "operation": "update TMDL Value.NativeQuery SQL",
@@ -846,12 +936,20 @@ def update_table_sql(
         "replacement_count": total,
         "changes": changes,
         "changed_files": sorted({ch["file"] for ch in changes}),
-        "warnings": [],
+        "warnings": warnings,
         "rolled_back": False,
     }
-    if len(changes) == 1 and last_updated_clean is not None and last_updated_m is not None:
+    if (
+        len(changes) == 1
+        and last_before_clean is not None
+        and last_updated_clean is not None
+        and last_updated_m is not None
+    ):
+        plan["before_sql"] = last_before_clean
         plan["updated_sql"] = last_updated_clean
         plan["updated_m_sql"] = last_updated_m
+        plan["sql_hash_before"] = compute_sql_hash(last_before_clean)
+        plan["sql_hash_after"] = compute_sql_hash(last_updated_clean)
     if dry_run:
         return plan
     for path, file_sources in per_file.items():
