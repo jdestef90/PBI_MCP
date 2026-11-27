@@ -97,8 +97,112 @@ def _format_outline_body(data: dict[str, Any]) -> list[str]:
     return out
 
 
+def _format_hunk_section_banner(hunk: dict[str, Any]) -> str:
+    match_sections: list[dict[str, Any]] = list(hunk.get("match_sections") or [])
+    grouped: list[tuple[str, list[int]]] = []
+    index_by_label: dict[str, int] = {}
+    for entry in match_sections:
+        label = str(entry.get("section") or "(preamble)")
+        ln = int(entry.get("line", 0))
+        if label not in index_by_label:
+            index_by_label[label] = len(grouped)
+            grouped.append((label, [ln]))
+        else:
+            lines_list = grouped[index_by_label[label]][1]
+            if ln not in lines_list:
+                lines_list.append(ln)
+
+    if not grouped:
+        s_ln = int(hunk.get("start_line", 1))
+        e_ln = int(hunk.get("end_line", s_ln))
+        return f"-- Lines {s_ln}-{e_ln}"
+
+    if len(grouped) == 1:
+        label, lns = grouped[0]
+        if len(lns) == 1:
+            return f"-- Section: {label} (line {lns[0]})"
+        return f"-- Section: {label} (lines {', '.join(str(x) for x in lns)})"
+
+    parts: list[str] = []
+    for label, lns in grouped:
+        if len(lns) == 1:
+            parts.append(f"{label} (line {lns[0]})")
+        else:
+            parts.append(f"{label} (lines {', '.join(str(x) for x in lns)})")
+    return "-- Sections: " + ", ".join(parts)
+
+
+def _format_search_sql_text(data: dict[str, Any]) -> str:
+    """Render compact, unescaped plain text for hierarchical SQL search results."""
+    query = str(data.get("search") or "")
+    context_lines = int(data.get("context_lines", 2))
+    table = data.get("table")
+    partition = data.get("partition")
+    ctes = data.get("ctes")
+    sources_searched = int(data.get("sources_searched", 0))
+    matched_sources = int(data.get("matched_sources", 0))
+    total_matches = int(data.get("total_matches", 0))
+    results: list[dict[str, Any]] = list(data.get("results") or [])
+
+    scope_parts: list[str] = []
+    if table:
+        scope_parts.append(f"table '{table}'")
+    if partition:
+        scope_parts.append(f"partition '{partition}'")
+    if ctes:
+        scope_parts.append("sections: " + ", ".join(str(c) for c in ctes))
+    scope_desc = ", ".join(scope_parts) if scope_parts else "workspace"
+
+    line_word = "line" if total_matches == 1 else "lines"
+    matched_src_word = "source" if matched_sources == 1 else "sources"
+    searched_src_word = "source" if sources_searched == 1 else "sources"
+
+    header = "\n".join([
+        f'SQL Search: "{query}" (scope: {scope_desc}, context_lines: {context_lines})',
+        (
+            f"Matches: {total_matches} {line_word} across {matched_sources} {matched_src_word} "
+            f"(searched {sources_searched} {searched_src_word})"
+        ),
+    ])
+
+    if not results:
+        return f'{header}\n\nNo matches found for "{query}".'
+
+    blocks: list[str] = [header]
+    for src in results:
+        src_table = src.get("table") or "<unknown>"
+        src_part = src.get("partition") or "<unknown>"
+        src_lines = int(src.get("line_count", 0))
+        src_hash = src.get("sql_hash") or ""
+        hunks: list[dict[str, Any]] = list(src.get("hunks") or [])
+        max_ln = max(
+            (int(h.get("end_line", 1)) for h in hunks),
+            default=1,
+        )
+        pad = len(str(max_ln))
+
+        src_block: list[str] = [
+            f"=== Table: {src_table} | Partition: {src_part} "
+            f"(lines: {src_lines}, sql_hash: {src_hash}) ==="
+        ]
+        for idx, hunk in enumerate(hunks):
+            if idx > 0:
+                src_block.append("")
+            src_block.append(_format_hunk_section_banner(hunk))
+            for item in hunk.get("lines") or []:
+                marker = ">" if item.get("is_match") else " "
+                ln_num = int(item.get("line", 0))
+                txt = str(item.get("text", ""))
+                src_block.append(f"{marker} {ln_num:>{pad}} | {txt}")
+        blocks.append("\n".join(src_block))
+
+    return "\n\n".join(blocks)
+
+
 def format_get_table_sql_text(data: dict[str, Any]) -> str:
     """Render compact, unescaped plain text for MCP get_table_sql."""
+    if data.get("view") == "search":
+        return _format_search_sql_text(data)
     table = data.get("table") or "<unknown>"
     partition = data.get("partition") or "<unknown>"
     mode = data.get("mode") or "unknown"
@@ -173,8 +277,24 @@ def format_get_table_sql_text(data: dict[str, Any]) -> str:
 
 def format_get_table_sql_json(data: dict[str, Any]) -> dict[str, Any]:
     """Return a lean structured dict for MCP get_table_sql(..., format='json')."""
-    meta = data.get("sql_metadata") or {}
     view = data.get("view") or "full"
+    if view == "search":
+        return {
+            "view": "search",
+            "search": data.get("search"),
+            "scope": data.get("scope"),
+            "table": data.get("table"),
+            "partition": data.get("partition"),
+            "ctes": data.get("ctes"),
+            "context_lines": int(data.get("context_lines", 2)),
+            "case_sensitive": bool(data.get("case_sensitive", False)),
+            "sources_searched": int(data.get("sources_searched", 0)),
+            "matched_sources": int(data.get("matched_sources", 0)),
+            "total_matches": int(data.get("total_matches", 0)),
+            "total_occurrences": int(data.get("total_occurrences", 0)),
+            "results": list(data.get("results") or []),
+        }
+    meta = data.get("sql_metadata") or {}
     out: dict[str, Any] = {
         "table": data.get("table"),
         "partition": data.get("partition"),

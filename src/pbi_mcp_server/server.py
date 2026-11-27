@@ -225,6 +225,25 @@ def _build_server_and_tools(
                 )
             ),
         ] = None,
+        search: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional case-insensitive substring to search across Clean SQL View "
+                    "(workspace-wide when table_name is omitted, or scoped by table_name, "
+                    "partition, and ctes)."
+                )
+            ),
+        ] = None,
+        context_lines: Annotated[
+            int,
+            Field(
+                description=(
+                    "Number of surrounding context lines to include around each search match "
+                    "(default 2, must be >= 0)."
+                )
+            ),
+        ] = 2,
         format: Annotated[
             Literal["text", "json"],
             Field(
@@ -235,7 +254,7 @@ def _build_server_and_tools(
         ] = "text",
         workspace: WorkspaceArg = None,
     ) -> str | dict[str, Any]:
-        """Extract Partition SQL (Clean SQL View or outline) for a table."""
+        """Extract or search Partition SQL (Clean SQL View or outline) across workspace, table, or SQL Sections."""  # noqa: E501
         if format is None:
             fmt = "text"
         elif isinstance(format, str):
@@ -254,6 +273,8 @@ def _build_server_and_tools(
             ctes=ctes,
             start_line=start_line,
             end_line=end_line,
+            search=search,
+            context_lines=context_lines,
         )
         if fmt == "json":
             return format_get_table_sql_json(data)
