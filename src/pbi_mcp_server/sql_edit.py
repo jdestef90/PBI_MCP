@@ -5,9 +5,10 @@ from __future__ import annotations
 import difflib
 import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any
 
-from .errors import InvalidArgumentError, PreconditionFailedError
+from .errors import InvalidArgumentError, ObjectNotFoundError, PreconditionFailedError
 from .m_codec import (
     MSerializationDescriptor,
     decode_m_sql_expression,
@@ -15,9 +16,30 @@ from .m_codec import (
     split_clean_sql_segments,
 )
 from .models import MutationDiff
+from .sql_sections import (
+    SqlSection,
+    SqlStructure,
+    _extract_table_refs,
+    _find_matching_rparen_token,
+    _tokenize_sql,
+    scan_sql_structure,
+    unquote_sql_identifier,
+)
 
 _PIPE_PREFIX_RE = re.compile(r"^[ \t]*\d+[ \t]*\|(?: |$)")
 _COLON_PREFIX_RE = re.compile(r"^[ \t]*\d+:(?: |$)")
+_CTE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_BATCH_EDIT_ALLOWED_KEYS = frozenset({
+    "old_text",
+    "new_text",
+    "cte",
+    "start_line",
+    "end_line",
+    "after_cte",
+    "before_cte",
+    "delete_cte",
+    "expected_replacements",
+})
 
 
 def _normalize_newlines(text: str) -> str:
@@ -173,6 +195,1207 @@ def apply_text_edit(
     out_lines.extend(sql_lines[cursor:])
 
     return "\n".join(out_lines), len(match_starts), "whitespace_normalized"
+
+
+@dataclass(frozen=True, slots=True)
+class TextPatch:
+    """Character-level splice against a pre-edit Clean SQL View snapshot."""
+
+    start: int
+    end: int
+    replacement: str
+    edit_index: int = 0
+    label: str = ""
+
+
+def _resolve_sql_section(
+    structure: SqlStructure, cte: str, *, role: str = "SQL Section"
+) -> SqlSection:
+    cleaned = unquote_sql_identifier(cte.strip())
+    if not cleaned:
+        raise InvalidArgumentError(
+            f"{role} name must be a non-empty string.",
+            code="INVALID_ARGUMENT",
+        )
+    by_cf = {s.name.casefold(): s for s in structure.sections}
+    found = by_cf.get(cleaned.casefold())
+    if found is None:
+        available = [s.name for s in structure.sections]
+        avail_str = ", ".join(available) if available else "(none)"
+        raise ObjectNotFoundError(
+            f"Unknown {role} {cte!r}. Available SQL Sections: {avail_str}.",
+            code="OBJECT_NOT_FOUND",
+            details={"requested": cte, "available_sections": available},
+        )
+    return found
+
+
+def _line_start_if_ws_only(text: str, offset: int) -> int:
+    line_start = text.rfind("\n", 0, offset) + 1
+    if text[line_start:offset].strip(" \t") == "":
+        return line_start
+    return offset
+
+
+def _section_text_scope(clean_sql: str, section: SqlSection) -> tuple[int, int]:
+    if section.kind == "cte":
+        return section.inner_span
+    return _line_start_if_ws_only(clean_sql, section.outer_span[0]), len(clean_sql)
+
+
+def _find_text_edit_patches(
+    clean_sql: str,
+    scope_start: int,
+    scope_end: int,
+    *,
+    old_text: str,
+    new_text: str,
+    expected_replacements: int | None = None,
+    edit_index: int = 0,
+    label: str = "text replacement",
+) -> tuple[list[TextPatch], int, str]:
+    scoped = clean_sql[scope_start:scope_end]
+    eff_old, old_stripped = strip_line_number_prefixes(old_text, reference_sql=scoped)
+    eff_new, _ = strip_line_number_prefixes(
+        new_text,
+        reference_sql=None if old_stripped else scoped,
+    )
+    old_norm = _normalize_newlines(eff_old)
+    new_norm = _normalize_newlines(eff_new)
+    if not old_norm:
+        raise InvalidArgumentError("old_text must not be empty.", code="INVALID_ARGUMENT")
+
+    patches: list[TextPatch] = []
+    pos = 0
+    step = len(old_norm)
+    while True:
+        found = scoped.find(old_norm, pos)
+        if found < 0:
+            break
+        patches.append(
+            TextPatch(
+                start=scope_start + found,
+                end=scope_start + found + step,
+                replacement=new_norm,
+                edit_index=edit_index,
+                label=label,
+            )
+        )
+        pos = found + step
+    if patches:
+        return patches, len(patches), "exact"
+
+    # Whitespace-normalized line-block fallback within scope
+    line_starts: list[int] = [0]
+    nl_pos = scoped.find("\n")
+    while nl_pos != -1:
+        line_starts.append(nl_pos + 1)
+        nl_pos = scoped.find("\n", nl_pos + 1)
+    sql_lines = scoped.split("\n")
+
+    old_for_lines = (
+        old_norm[:-1] if old_norm.endswith("\n") and not old_norm.endswith("\n\n") else old_norm
+    )
+    new_for_lines = (
+        new_norm[:-1] if new_norm.endswith("\n") and not new_norm.endswith("\n\n") else new_norm
+    )
+    old_lines = old_for_lines.split("\n")
+    new_lines = [] if new_for_lines == "" else new_for_lines.split("\n")
+
+    span_len = len(old_lines)
+    if span_len == 0 or span_len > len(sql_lines):
+        return [], 0, "none"
+
+    old_stripped_lines = [ln.strip(" \t") for ln in old_lines]
+    sql_stripped_lines = [ln.strip(" \t") for ln in sql_lines]
+
+    match_starts: list[int] = []
+    idx = 0
+    limit = len(sql_lines) - span_len
+    while idx <= limit:
+        if sql_stripped_lines[idx : idx + span_len] == old_stripped_lines:
+            match_starts.append(idx)
+            idx += span_len
+        else:
+            idx += 1
+
+    if not match_starts:
+        return [], 0, "none"
+
+    if len(match_starts) > 1 and expected_replacements is None:
+        raise PreconditionFailedError(
+            f"Ambiguous whitespace-normalized match: found {len(match_starts)} matching "
+            "locations. Provide more context, exact indentation, or pass "
+            f"expected_replacements={len(match_starts)}.",
+            code="PRECONDITION_FAILED",
+            expected=1,
+            actual=len(match_starts),
+        )
+
+    for start_idx in match_starts:
+        end_idx = start_idx + span_len - 1
+        matched_block = sql_lines[start_idx : end_idx + 1]
+        reindented = _reindent_replacement(matched_block, old_lines, new_lines)
+        if reindented:
+            rel_start = line_starts[start_idx]
+            rel_end = (
+                line_starts[end_idx + 1] - 1 if end_idx + 1 < len(sql_lines) else len(scoped)
+            )
+            rep_str = "\n".join(reindented)
+        else:
+            if end_idx + 1 < len(sql_lines):
+                rel_start = line_starts[start_idx]
+                rel_end = line_starts[end_idx + 1]
+            elif start_idx > 0:
+                rel_start = line_starts[start_idx] - 1
+                rel_end = len(scoped)
+            else:
+                rel_start = 0
+                rel_end = len(scoped)
+            rep_str = ""
+        patches.append(
+            TextPatch(
+                start=scope_start + rel_start,
+                end=scope_start + rel_end,
+                replacement=rep_str,
+                edit_index=edit_index,
+                label=label,
+            )
+        )
+
+    return patches, len(match_starts), "whitespace_normalized"
+
+
+def apply_text_patches(clean_sql: str, patches: list[TextPatch]) -> str:
+    """Apply non-overlapping TextPatches in descending offset order."""
+    updated = clean_sql
+    for patch in sorted(patches, key=lambda p: (p.start, p.end), reverse=True):
+        updated = updated[: patch.start] + patch.replacement + updated[patch.end :]
+    return updated
+
+
+def apply_cte_scoped_text_edit(
+    clean_sql: str,
+    *,
+    cte: str,
+    old_text: str,
+    new_text: str,
+    expected_replacements: int | None = None,
+    structure: SqlStructure | None = None,
+) -> tuple[str, int, str, str]:
+    """Apply forgiving text replacement strictly inside a named SQL Section."""
+    struct = structure if structure is not None else scan_sql_structure(clean_sql)
+    section = _resolve_sql_section(struct, cte)
+    scope_start, scope_end = _section_text_scope(clean_sql, section)
+    patches, count, match_mode = _find_text_edit_patches(
+        clean_sql,
+        scope_start,
+        scope_end,
+        old_text=old_text,
+        new_text=new_text,
+        expected_replacements=expected_replacements,
+        label=f"replace in {section.name!r}",
+    )
+    if not patches:
+        return clean_sql, 0, match_mode, section.name
+    return apply_text_patches(clean_sql, patches), count, match_mode, section.name
+
+
+def _detect_indent_unit(clean_sql: str) -> str:
+    min_spaces: int | None = None
+    for line in clean_sql.split("\n"):
+        if not line.strip(" \t"):
+            continue
+        if line.startswith("\t"):
+            return "\t"
+        lead = len(line) - len(line.lstrip(" "))
+        if lead > 0 and (min_spaces is None or lead < min_spaces):
+            min_spaces = lead
+    if min_spaces == 2:
+        return "  "
+    return "    "
+
+
+def _strip_outer_blank_lines(text: str) -> list[str]:
+    lines = _normalize_newlines(text).split("\n")
+    while lines and lines[0].strip(" \t") == "":
+        lines.pop(0)
+    while lines and lines[-1].strip(" \t") == "":
+        lines.pop()
+    return lines
+
+
+def _format_cte_body_lines(raw_body: str, *, target_indent: str) -> list[str]:
+    lines = _strip_outer_blank_lines(raw_body)
+    if not lines:
+        raise InvalidArgumentError("CTE body must not be empty.", code="INVALID_ARGUMENT")
+    if not target_indent:
+        return lines
+    if _common_leading_ws(lines) == "":
+        return [(target_indent + ln) if ln.strip(" \t") != "" else "" for ln in lines]
+    return lines
+
+
+def _unwrap_cte_body(raw_body: str, cte_name: str) -> tuple[str, str | None]:
+    """Unwrap accidental `[WITH] <cte> AS (...) [,]` or outer `(...) [,]` wrappers."""
+    norm = _normalize_newlines(raw_body)
+    tokens = _tokenize_sql(norm)
+    if not tokens:
+        return norm, None
+
+    target_cf = unquote_sql_identifier(cte_name).casefold()
+    n = len(tokens)
+    idx = 0
+    if tokens[idx].kind == "word" and tokens[idx].upper == "WITH":
+        idx += 1
+        if idx < n and tokens[idx].kind == "word" and tokens[idx].upper == "RECURSIVE":
+            idx += 1
+
+    if (
+        idx < n
+        and tokens[idx].kind in {"word", "ident"}
+        and unquote_sql_identifier(tokens[idx].text).casefold() == target_cf
+    ):
+        j = idx + 1
+        if j < n and tokens[j].kind == "lparen":
+            col_close = _find_matching_rparen_token(tokens, j)
+            if col_close is not None:
+                j = col_close + 1
+        if j < n and tokens[j].kind == "word" and tokens[j].upper == "AS":
+            j += 1
+            if (
+                j + 1 < n
+                and tokens[j].kind == "word"
+                and tokens[j].upper == "NOT"
+                and tokens[j + 1].kind == "word"
+                and tokens[j + 1].upper == "MATERIALIZED"
+            ):
+                j += 2
+            elif j < n and tokens[j].kind == "word" and tokens[j].upper == "MATERIALIZED":
+                j += 1
+            if j < n and tokens[j].kind == "lparen":
+                close_idx = _find_matching_rparen_token(tokens, j)
+                if close_idx is not None and (
+                    close_idx == n - 1
+                    or (close_idx == n - 2 and tokens[-1].kind == "comma")
+                ):
+                    inner = norm[tokens[j].end : tokens[close_idx].start]
+                    note = (
+                        f"Auto-unwrapped '{cte_name} AS (...)' wrapper from new_text "
+                        f"for CTE '{cte_name}'."
+                    )
+                    return inner, note
+
+    if tokens[0].kind == "lparen":
+        close_idx = _find_matching_rparen_token(tokens, 0)
+        if close_idx is not None and (
+            close_idx == n - 1 or (close_idx == n - 2 and tokens[-1].kind == "comma")
+        ):
+            inner = norm[tokens[0].end : tokens[close_idx].start]
+            note = (
+                f"Auto-unwrapped outer parentheses '(...)' from new_text "
+                f"for CTE '{cte_name}'."
+            )
+            return inner, note
+
+    return norm, None
+
+
+def build_whole_cte_replace_patch(
+    clean_sql: str,
+    structure: SqlStructure,
+    *,
+    cte: str,
+    new_text: str,
+    edit_index: int = 0,
+) -> tuple[TextPatch, str, list[str]]:
+    """Build a TextPatch replacing the inner body of an existing CTE or `main`."""
+    section = _resolve_sql_section(structure, cte)
+    eff_new, _ = strip_line_number_prefixes(new_text)
+    notes: list[str] = []
+
+    if section.kind == "main":
+        body_lines = _strip_outer_blank_lines(eff_new)
+        if not body_lines:
+            raise InvalidArgumentError(
+                "Replacement SQL for 'main' must not be empty.",
+                code="INVALID_ARGUMENT",
+            )
+        start = _line_start_if_ws_only(clean_sql, section.outer_span[0])
+        end = section.outer_span[1]
+        main_indent = clean_sql[start : section.outer_span[0]]
+        formatted_lines = _format_cte_body_lines(
+            "\n".join(body_lines), target_indent=main_indent
+        )
+        return (
+            TextPatch(
+                start=start,
+                end=end,
+                replacement="\n".join(formatted_lines),
+                edit_index=edit_index,
+                label="replace section 'main'",
+            ),
+            section.name,
+            notes,
+        )
+
+    unwrapped, note = _unwrap_cte_body(eff_new, section.name)
+    if note:
+        notes.append(note)
+
+    inner_start, inner_end = section.inner_span
+    orig_inner = clean_sql[inner_start:inner_end]
+    closing_line_start = clean_sql.rfind("\n", 0, inner_end) + 1
+    raw_closing_prefix = clean_sql[closing_line_start:inner_end]
+    closing_indent = raw_closing_prefix if raw_closing_prefix.strip(" \t") == "" else ""
+
+    is_multiline_orig = "\n" in orig_inner
+    orig_lines = orig_inner.split("\n")
+    orig_body_indent = _common_leading_ws(
+        orig_lines[1:-1] if len(orig_lines) > 2 else orig_lines
+    )
+    if not orig_body_indent:
+        orig_body_indent = closing_indent + _detect_indent_unit(clean_sql)
+
+    body_lines = _format_cte_body_lines(
+        unwrapped,
+        target_indent=orig_body_indent if (is_multiline_orig or "\n" in unwrapped.strip()) else "",
+    )
+    if is_multiline_orig or len(body_lines) > 1:
+        replacement = "\n" + "\n".join(body_lines) + "\n" + closing_indent
+    else:
+        replacement = body_lines[0].strip()
+
+    return (
+        TextPatch(
+            start=inner_start,
+            end=inner_end,
+            replacement=replacement,
+            edit_index=edit_index,
+            label=f"replace CTE {section.name!r}",
+        ),
+        section.name,
+        notes,
+    )
+
+
+def apply_whole_cte_replace_edit(
+    clean_sql: str,
+    *,
+    cte: str,
+    new_text: str,
+    structure: SqlStructure | None = None,
+) -> tuple[str, int, str, list[str]]:
+    """Replace the inner body of an existing CTE (or `main`) while preserving surrounding syntax."""
+    struct = structure if structure is not None else scan_sql_structure(clean_sql)
+    patch, sec_name, notes = build_whole_cte_replace_patch(
+        clean_sql,
+        struct,
+        cte=cte,
+        new_text=new_text,
+    )
+    updated = apply_text_patches(clean_sql, [patch])
+    count = 0 if updated == clean_sql else 1
+    return updated, count, sec_name, notes
+
+
+def _validate_new_cte_name(cte: str, structure: SqlStructure) -> tuple[str, str]:
+    """Return `(raw_sql_name, unquoted_name)` or raise InvalidArgumentError."""
+    raw = cte.strip()
+    if not raw:
+        raise InvalidArgumentError("cte name must not be empty.", code="INVALID_ARGUMENT")
+    unquoted = unquote_sql_identifier(raw)
+    if not unquoted:
+        raise InvalidArgumentError("cte name must not be empty.", code="INVALID_ARGUMENT")
+    if unquoted.casefold() == "main":
+        raise InvalidArgumentError(
+            "Cannot insert a CTE named 'main'; 'main' is reserved for the final SELECT section.",
+            code="INVALID_ARGUMENT",
+        )
+    if raw == unquoted and not _CTE_IDENT_RE.match(raw):
+        raise InvalidArgumentError(
+            f"Invalid CTE name {cte!r}. Provide a valid SQL identifier.",
+            code="INVALID_ARGUMENT",
+        )
+    existing_cf = {s.name.casefold(): s.name for s in structure.sections if s.kind == "cte"}
+    if unquoted.casefold() in existing_cf:
+        raise InvalidArgumentError(
+            f"CTE {existing_cf[unquoted.casefold()]!r} already exists. "
+            f"Omit after_cte/before_cte to replace its body instead.",
+            code="INVALID_ARGUMENT",
+        )
+    return raw, unquoted
+
+
+def _cte_header_indent(clean_sql: str, section: SqlSection) -> str:
+    start = section.outer_span[0]
+    line_start = clean_sql.rfind("\n", 0, start) + 1
+    prefix = clean_sql[line_start:start]
+    if prefix.strip(" \t") == "":
+        return prefix
+    # CTE starts on the same line as `WITH` — use the leading whitespace of the `WITH` line
+    return prefix[: len(prefix) - len(prefix.lstrip(" \t"))]
+
+
+def _cte_body_indent(clean_sql: str, section: SqlSection, fallback_cte_indent: str) -> str:
+    orig_inner = clean_sql[section.inner_span[0] : section.inner_span[1]]
+    orig_lines = orig_inner.split("\n")
+    detected = _common_leading_ws(orig_lines[1:-1] if len(orig_lines) > 2 else orig_lines)
+    if detected:
+        return detected
+    return fallback_cte_indent + _detect_indent_unit(clean_sql)
+
+
+def build_cte_insert_patch(
+    clean_sql: str,
+    structure: SqlStructure,
+    *,
+    cte: str,
+    new_text: str,
+    after_cte: str | None = None,
+    before_cte: str | None = None,
+    edit_index: int = 0,
+) -> tuple[TextPatch, str, list[str]]:
+    """Build a zero-width TextPatch inserting a new CTE at the requested anchor position."""
+    raw_name, unquoted_name = _validate_new_cte_name(cte, structure)
+    if after_cte is None and before_cte is None:
+        raise InvalidArgumentError(
+            "Provide after_cte and/or before_cte to insert a new CTE.",
+            code="INVALID_ARGUMENT",
+        )
+
+    sec_idx_by_cf = {s.name.casefold(): i for i, s in enumerate(structure.sections)}
+    after_idx: int | None = None
+    before_idx: int | None = None
+
+    if after_cte is not None:
+        after_sec = _resolve_sql_section(structure, after_cte, role="after_cte anchor")
+        if after_sec.kind == "main":
+            raise PreconditionFailedError(
+                "Cannot insert a CTE after 'main'; CTEs must precede the final 'main' SELECT.",
+                code="PRECONDITION_FAILED",
+            )
+        after_idx = sec_idx_by_cf[after_sec.name.casefold()]
+
+    if before_cte is not None:
+        before_sec = _resolve_sql_section(structure, before_cte, role="before_cte anchor")
+        before_idx = sec_idx_by_cf[before_sec.name.casefold()]
+
+    if after_idx is not None and before_idx is not None and after_idx >= before_idx:
+        after_label = structure.sections[after_idx].name
+        before_label = structure.sections[before_idx].name
+        raise PreconditionFailedError(
+            f"Invalid CTE insertion order: after_cte={after_label!r} must precede "
+            f"before_cte={before_label!r}.",
+            code="PRECONDITION_FAILED",
+        )
+
+    eff_new, _ = strip_line_number_prefixes(new_text)
+    unwrapped, note = _unwrap_cte_body(eff_new, unquoted_name)
+    notes: list[str] = [note] if note else []
+
+    cte_sections = [s for s in structure.sections if s.kind == "cte"]
+
+    # Case 1: Non-CTE query — bootstrap `WITH <cte> AS (...)` right before `main`
+    if not structure.has_ctes:
+        main_sec = next((s for s in structure.sections if s.kind == "main"), None)
+        if main_sec is None:
+            raise InvalidArgumentError(
+                "Cannot insert a CTE into an empty SQL query.",
+                code="INVALID_ARGUMENT",
+            )
+        splice_pos = _line_start_if_ws_only(clean_sql, main_sec.outer_span[0])
+        base_indent = clean_sql[splice_pos : main_sec.outer_span[0]]
+        body_indent = base_indent + _detect_indent_unit(clean_sql)
+        body_lines = _format_cte_body_lines(unwrapped, target_indent=body_indent)
+        replacement = (
+            f"{base_indent}WITH {raw_name} AS (\n"
+            + "\n".join(body_lines)
+            + f"\n{base_indent})\n"
+        )
+        return (
+            TextPatch(
+                start=splice_pos,
+                end=splice_pos,
+                replacement=replacement,
+                edit_index=edit_index,
+                label=f"insert CTE {unquoted_name!r}",
+            ),
+            unquoted_name,
+            notes,
+        )
+
+    assert after_idx is not None or before_idx is not None
+    insert_slot = (after_idx + 1) if after_idx is not None else before_idx
+    assert insert_slot is not None
+
+    # Case 2: Insert before the first CTE (slot == 0)
+    if insert_slot == 0:
+        first_cte = cte_sections[0]
+        cte_indent = _cte_header_indent(clean_sql, first_cte)
+        body_indent = _cte_body_indent(clean_sql, first_cte, cte_indent)
+        body_lines = _format_cte_body_lines(unwrapped, target_indent=body_indent)
+        replacement = (
+            f"{raw_name} AS (\n"
+            + "\n".join(body_lines)
+            + f"\n{cte_indent}),\n{cte_indent}"
+        )
+        return (
+            TextPatch(
+                start=first_cte.outer_span[0],
+                end=first_cte.outer_span[0],
+                replacement=replacement,
+                edit_index=edit_index,
+                label=f"insert CTE {unquoted_name!r}",
+            ),
+            unquoted_name,
+            notes,
+        )
+
+    # Case 3: Insert after an existing CTE (between CTEs or before `main`)
+    prev_cte = cte_sections[insert_slot - 1]
+    cte_indent = _cte_header_indent(clean_sql, prev_cte)
+    body_indent = _cte_body_indent(clean_sql, prev_cte, cte_indent)
+    body_lines = _format_cte_body_lines(unwrapped, target_indent=body_indent)
+    replacement = (
+        f",\n{cte_indent}{raw_name} AS (\n"
+        + "\n".join(body_lines)
+        + f"\n{cte_indent})"
+    )
+    return (
+        TextPatch(
+            start=prev_cte.outer_span[1],
+            end=prev_cte.outer_span[1],
+            replacement=replacement,
+            edit_index=edit_index,
+            label=f"insert CTE {unquoted_name!r}",
+        ),
+        unquoted_name,
+        notes,
+    )
+
+
+def apply_cte_insert_edit(
+    clean_sql: str,
+    *,
+    cte: str,
+    new_text: str,
+    after_cte: str | None = None,
+    before_cte: str | None = None,
+    structure: SqlStructure | None = None,
+) -> tuple[str, int, str, list[str]]:
+    """Insert a new CTE at the requested position while managing WITH and commas."""
+    struct = structure if structure is not None else scan_sql_structure(clean_sql)
+    patch, inserted_name, notes = build_cte_insert_patch(
+        clean_sql,
+        struct,
+        cte=cte,
+        new_text=new_text,
+        after_cte=after_cte,
+        before_cte=before_cte,
+    )
+    updated = apply_text_patches(clean_sql, [patch])
+    return updated, 1, inserted_name, notes
+
+
+def build_cte_delete_patches(
+    clean_sql: str,
+    structure: SqlStructure,
+    deletions: list[tuple[int, str]],
+    *,
+    insert_slots: set[int] | None = None,
+) -> tuple[list[TextPatch], list[str]]:
+    """Build TextPatches removing one or more CTEs while fixing adjacent commas and WITH."""
+    cte_sections = [s for s in structure.sections if s.kind == "cte"]
+    cte_idx_by_cf = {s.name.casefold(): i for i, s in enumerate(cte_sections)}
+
+    resolved: list[tuple[int, int, SqlSection]] = []
+    for edit_index, cte_arg in deletions:
+        cleaned = unquote_sql_identifier(cte_arg.strip())
+        if not cleaned:
+            raise InvalidArgumentError("cte name must not be empty.", code="INVALID_ARGUMENT")
+        if cleaned.casefold() == "main":
+            raise InvalidArgumentError(
+                "Cannot delete the 'main' SQL Section; only named CTEs can be deleted.",
+                code="INVALID_ARGUMENT",
+            )
+        section = _resolve_sql_section(structure, cte_arg)
+        idx = cte_idx_by_cf[section.name.casefold()]
+        resolved.append((edit_index, idx, section))
+
+    deleted_idx_set = {idx for _, idx, _ in resolved}
+    deleted_names = [sec.name for _, _, sec in resolved]
+    has_insertions = bool(insert_slots)
+
+    # Deleting ALL existing CTEs (with no new CTEs inserted) removes the entire WITH clause
+    if len(deleted_idx_set) == len(cte_sections) and not has_insertions:
+        tokens = _tokenize_sql(clean_sql)
+        with_start = tokens[0].start if tokens else 0
+        del_start = _line_start_if_ws_only(clean_sql, with_start)
+        last_cte = cte_sections[-1]
+        main_sec = next((s for s in structure.sections if s.kind == "main"), None)
+        if main_sec is not None:
+            between = clean_sql[last_cte.outer_span[1] : main_sec.outer_span[0]]
+            if between.strip() == "":
+                del_end = _line_start_if_ws_only(clean_sql, main_sec.outer_span[0])
+            else:
+                pos = last_cte.outer_span[1]
+                nl = clean_sql.find("\n", pos, main_sec.outer_span[0])
+                del_end = (nl + 1) if nl != -1 else main_sec.outer_span[0]
+        else:
+            del_end = len(clean_sql)
+        label = (
+            f"delete CTE {deleted_names[0]!r}"
+            if len(deleted_names) == 1
+            else f"delete CTEs {', '.join(deleted_names)}"
+        )
+        return (
+            [
+                TextPatch(
+                    start=del_start,
+                    end=del_end,
+                    replacement="",
+                    edit_index=resolved[0][0],
+                    label=label,
+                )
+            ],
+            deleted_names,
+        )
+
+    patches: list[TextPatch] = []
+    for edit_index, idx, sec in resolved:
+        has_surviving_after = any(
+            j not in deleted_idx_set for j in range(idx + 1, len(cte_sections))
+        ) or bool(insert_slots and any(slot > idx for slot in insert_slots))
+
+        if has_surviving_after and idx + 1 < len(cte_sections):
+            next_sec = cte_sections[idx + 1]
+            between = clean_sql[sec.outer_span[1] : next_sec.outer_span[0]]
+            between_tokens = _tokenize_sql(between)
+            comma_tok = next((t for t in between_tokens if t.kind == "comma"), None)
+            if comma_tok is not None and between[comma_tok.end :].strip() != "":
+                # Preserve comments between comma and next_sec
+                after_comma = sec.outer_span[1] + comma_tok.end
+                nl = clean_sql.find("\n", after_comma, next_sec.outer_span[0])
+                del_end = (nl + 1) if nl != -1 else next_sec.outer_span[0]
+                del_start = (
+                    _line_start_if_ws_only(clean_sql, sec.outer_span[0])
+                    if idx > 0
+                    else sec.outer_span[0]
+                )
+            else:
+                del_start = sec.outer_span[0]
+                del_end = next_sec.outer_span[0]
+        else:
+            prev_sec = cte_sections[idx - 1]
+            del_start = prev_sec.outer_span[1]
+            del_end = sec.outer_span[1]
+
+        patches.append(
+            TextPatch(
+                start=del_start,
+                end=del_end,
+                replacement="",
+                edit_index=edit_index,
+                label=f"delete CTE {sec.name!r}",
+            )
+        )
+
+    return patches, deleted_names
+
+
+def detect_deleted_cte_reference_warnings(
+    updated_clean_sql: str,
+    deleted_cte_names: list[str],
+) -> list[str]:
+    """Warn if any remaining SQL Section in updated_clean_sql still references a deleted CTE."""
+    if not deleted_cte_names:
+        return []
+    after_struct = scan_sql_structure(updated_clean_sql)
+    existing_cte_cfs = {s.name.casefold() for s in after_struct.sections if s.kind == "cte"}
+    warnings: list[str] = []
+    seen_cf: set[str] = set()
+    for del_name in deleted_cte_names:
+        del_cf = del_name.casefold()
+        if del_cf in seen_cf or del_cf in existing_cte_cfs:
+            continue
+        seen_cf.add(del_cf)
+        referencing: list[str] = []
+        for sec in after_struct.sections:
+            span = sec.inner_span if sec.kind == "cte" else sec.outer_span
+            sec_tokens = _tokenize_sql(updated_clean_sql[span[0] : span[1]])
+            refs, _ = _extract_table_refs(
+                sec_tokens,
+                cte_names_by_cf={del_cf: del_name},
+                self_name_cf=None,
+            )
+            if del_name in refs:
+                referencing.append(sec.name)
+        if referencing:
+            warnings.append(
+                f"Deleted CTE '{del_name}' is still referenced by downstream SQL Section(s): "
+                f"{', '.join(referencing)}."
+            )
+    return warnings
+
+
+def apply_cte_delete_edit(
+    clean_sql: str,
+    *,
+    cte: str,
+    structure: SqlStructure | None = None,
+) -> tuple[str, int, str, list[str]]:
+    """Delete a named CTE, fix adjacent commas/WITH, and check downstream references."""
+    struct = structure if structure is not None else scan_sql_structure(clean_sql)
+    patches, deleted_names = build_cte_delete_patches(clean_sql, struct, [(0, cte)])
+    updated = apply_text_patches(clean_sql, patches)
+    ref_warnings = detect_deleted_cte_reference_warnings(updated, deleted_names)
+    return updated, 1, deleted_names[0], ref_warnings
+
+
+def build_line_range_patch(
+    clean_sql: str,
+    *,
+    start_line: int | None,
+    end_line: int | None,
+    new_text: str,
+    edit_index: int = 0,
+) -> TextPatch:
+    """Build a TextPatch replacing an inclusive 1-based line range in Clean SQL View."""
+    if start_line is None or isinstance(start_line, bool):
+        raise InvalidArgumentError(
+            "start_line is required when end_line is provided.",
+            code="INVALID_ARGUMENT",
+        )
+    eff_end = start_line if end_line is None else end_line
+    if isinstance(eff_end, bool):
+        raise InvalidArgumentError(
+            f"end_line must be an integer (received {end_line!r}).",
+            code="INVALID_ARGUMENT",
+        )
+    if start_line < 1:
+        raise InvalidArgumentError(
+            f"start_line must be >= 1 (received {start_line}).",
+            code="INVALID_ARGUMENT",
+        )
+    if eff_end < 1:
+        raise InvalidArgumentError(
+            f"end_line must be >= 1 (received {eff_end}).",
+            code="INVALID_ARGUMENT",
+        )
+    if eff_end < start_line:
+        raise InvalidArgumentError(
+            f"end_line ({eff_end}) must be >= start_line ({start_line}).",
+            code="INVALID_ARGUMENT",
+        )
+
+    lines = clean_sql.split("\n") if clean_sql != "" else []
+    line_count = len(lines)
+    if start_line > line_count or eff_end > line_count:
+        raise InvalidArgumentError(
+            f"Line range {start_line}-{eff_end} is out of bounds for query with "
+            f"{line_count} line(s).",
+            code="INVALID_ARGUMENT",
+            details={
+                "start_line": start_line,
+                "end_line": eff_end,
+                "line_count": line_count,
+            },
+        )
+
+    line_starts: list[int] = [0]
+    nl_pos = clean_sql.find("\n")
+    while nl_pos != -1:
+        line_starts.append(nl_pos + 1)
+        nl_pos = clean_sql.find("\n", nl_pos + 1)
+
+    eff_new, _ = strip_line_number_prefixes(new_text)
+    norm_new = _normalize_newlines(eff_new)
+    replacement_lines = [] if norm_new == "" else norm_new.splitlines()
+
+    if replacement_lines:
+        span_start = line_starts[start_line - 1]
+        span_end = line_starts[eff_end] - 1 if eff_end < line_count else len(clean_sql)
+        rep = "\n".join(replacement_lines)
+    else:
+        if eff_end < line_count:
+            span_start = line_starts[start_line - 1]
+            span_end = line_starts[eff_end]
+        elif start_line > 1:
+            span_start = line_starts[start_line - 1] - 1
+            span_end = len(clean_sql)
+        else:
+            span_start = 0
+            span_end = len(clean_sql)
+        rep = ""
+
+    return TextPatch(
+        start=span_start,
+        end=span_end,
+        replacement=rep,
+        edit_index=edit_index,
+        label=f"replace lines {start_line}-{eff_end}",
+    )
+
+
+def _validate_non_overlapping_patches(patches: list[TextPatch]) -> None:
+    ordered = sorted(patches, key=lambda p: (p.start, p.end, p.edit_index))
+    for i in range(1, len(ordered)):
+        prev = ordered[i - 1]
+        curr = ordered[i]
+        if prev.edit_index == curr.edit_index:
+            continue
+        if prev.start == prev.end == curr.start == curr.end:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: edit #{prev.edit_index + 1} ({prev.label}) and "
+                f"edit #{curr.edit_index + 1} ({curr.label}) target the exact same position.",
+                code="INVALID_ARGUMENT",
+            )
+        if curr.start < prev.end:
+            raise InvalidArgumentError(
+                f"Overlapping batch edits: edit #{prev.edit_index + 1} ({prev.label}) "
+                f"overlaps with edit #{curr.edit_index + 1} ({curr.label}).",
+                code="INVALID_ARGUMENT",
+            )
+
+
+def apply_batch_edits(
+    clean_sql: str,
+    edits: list[dict[str, Any]],
+    *,
+    structure: SqlStructure | None = None,
+) -> tuple[str, int, list[str]]:
+    """Resolve and atomically apply a batch of edits against one pre-edit Clean SQL View."""
+    if not isinstance(edits, list) or not edits:
+        raise InvalidArgumentError(
+            "edits must be a non-empty list of edit objects.",
+            code="INVALID_ARGUMENT",
+        )
+
+    struct = structure if structure is not None else scan_sql_structure(clean_sql)
+    sec_idx_by_cf = {s.name.casefold(): i for i, s in enumerate(struct.sections)}
+
+    parsed_entries: list[tuple[int, str, dict[str, Any]]] = []
+    deleted_cte_cfs: dict[str, int] = {}
+    inserted_cte_cfs: dict[str, int] = {}
+    whole_replaced_cfs: dict[str, int] = {}
+    scoped_cfs: dict[str, list[int]] = {}
+    anchor_refs: list[tuple[str, int, str]] = []
+    insert_slots: set[int] = set()
+    delete_entries: list[tuple[int, str]] = []
+
+    for idx, raw_entry in enumerate(edits):
+        if not isinstance(raw_entry, dict):
+            raise InvalidArgumentError(
+                f"Batch edit #{idx + 1} must be a dict.",
+                code="INVALID_ARGUMENT",
+            )
+        unknown_keys = sorted(set(raw_entry) - _BATCH_EDIT_ALLOWED_KEYS)
+        if unknown_keys:
+            raise InvalidArgumentError(
+                f"Batch edit #{idx + 1} contains unknown field(s): {', '.join(unknown_keys)}. "
+                f"Allowed fields: {', '.join(sorted(_BATCH_EDIT_ALLOWED_KEYS))}.",
+                code="INVALID_ARGUMENT",
+            )
+
+        old_text = raw_entry.get("old_text")
+        new_text = raw_entry.get("new_text")
+        cte = raw_entry.get("cte")
+        start_line = raw_entry.get("start_line")
+        end_line = raw_entry.get("end_line")
+        after_cte = raw_entry.get("after_cte")
+        before_cte = raw_entry.get("before_cte")
+        delete_cte = bool(raw_entry.get("delete_cte", False))
+        has_line_range = start_line is not None or end_line is not None
+        has_insert_anchor = after_cte is not None or before_cte is not None
+
+        if delete_cte:
+            if cte is None or not isinstance(cte, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cte is required when delete_cte=True.",
+                    code="INVALID_ARGUMENT",
+                )
+            if (
+                old_text is not None
+                or new_text is not None
+                or has_line_range
+                or has_insert_anchor
+            ):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cannot combine delete_cte=True with old_text, "
+                    "new_text, start_line/end_line, or after_cte/before_cte.",
+                    code="INVALID_ARGUMENT",
+                )
+            cleaned = unquote_sql_identifier(cte.strip())
+            if cleaned.casefold() == "main":
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cannot delete the 'main' SQL Section.",
+                    code="INVALID_ARGUMENT",
+                )
+            sec = _resolve_sql_section(struct, cte)
+            cf = sec.name.casefold()
+            if cf in deleted_cte_cfs:
+                raise InvalidArgumentError(
+                    f"Conflicting batch edits: CTE {sec.name!r} is deleted more than once "
+                    f"(edit #{deleted_cte_cfs[cf] + 1} and edit #{idx + 1}).",
+                    code="INVALID_ARGUMENT",
+                )
+            deleted_cte_cfs[cf] = idx
+            delete_entries.append((idx, cte))
+            parsed_entries.append((idx, "delete_cte", raw_entry))
+            continue
+
+        if has_insert_anchor:
+            if cte is None or not isinstance(cte, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cte is required when using after_cte or before_cte.",
+                    code="INVALID_ARGUMENT",
+                )
+            if new_text is None or not isinstance(new_text, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: new_text is required for CTE insertion.",
+                    code="INVALID_ARGUMENT",
+                )
+            if old_text is not None or has_line_range:
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cannot combine after_cte/before_cte with "
+                    "old_text or start_line/end_line.",
+                    code="INVALID_ARGUMENT",
+                )
+            _, unquoted = _validate_new_cte_name(cte, struct)
+            cf = unquoted.casefold()
+            if cf in inserted_cte_cfs:
+                raise InvalidArgumentError(
+                    f"Conflicting batch edits: CTE {unquoted!r} is inserted more than once "
+                    f"(edit #{inserted_cte_cfs[cf] + 1} and edit #{idx + 1}).",
+                    code="INVALID_ARGUMENT",
+                )
+            inserted_cte_cfs[cf] = idx
+
+            after_idx_val: int | None = None
+            before_idx_val: int | None = None
+            if after_cte is not None:
+                after_sec = _resolve_sql_section(struct, after_cte, role="after_cte anchor")
+                if after_sec.kind == "main":
+                    raise PreconditionFailedError(
+                        "Cannot insert a CTE after 'main'; CTEs must precede the final "
+                        "'main' SELECT.",
+                        code="PRECONDITION_FAILED",
+                    )
+                after_idx_val = sec_idx_by_cf[after_sec.name.casefold()]
+                anchor_refs.append((after_sec.name.casefold(), idx, after_sec.name))
+            if before_cte is not None:
+                before_sec = _resolve_sql_section(struct, before_cte, role="before_cte anchor")
+                before_idx_val = sec_idx_by_cf[before_sec.name.casefold()]
+                if before_sec.kind == "cte":
+                    anchor_refs.append((before_sec.name.casefold(), idx, before_sec.name))
+            if (
+                after_idx_val is not None
+                and before_idx_val is not None
+                and after_idx_val >= before_idx_val
+            ):
+                raise PreconditionFailedError(
+                    f"Invalid CTE insertion order in edit #{idx + 1}: "
+                    f"after_cte={struct.sections[after_idx_val].name!r} must precede "
+                    f"before_cte={struct.sections[before_idx_val].name!r}.",
+                    code="PRECONDITION_FAILED",
+                )
+            slot = (after_idx_val + 1) if after_idx_val is not None else before_idx_val
+            if slot is not None:
+                insert_slots.add(slot)
+            parsed_entries.append((idx, "insert_cte", raw_entry))
+            continue
+
+        if has_line_range:
+            if old_text is not None or cte is not None:
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: cannot combine start_line/end_line with "
+                    "old_text or cte.",
+                    code="INVALID_ARGUMENT",
+                )
+            if new_text is None or not isinstance(new_text, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: new_text is required for line-range replacement.",
+                    code="INVALID_ARGUMENT",
+                )
+            parsed_entries.append((idx, "line_range", raw_entry))
+            continue
+
+        if old_text is not None:
+            if not isinstance(old_text, str) or not old_text:
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: old_text must be a non-empty string.",
+                    code="INVALID_ARGUMENT",
+                )
+            if new_text is None or not isinstance(new_text, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: new_text is required.",
+                    code="INVALID_ARGUMENT",
+                )
+            if cte is not None:
+                sec = _resolve_sql_section(struct, cte)
+                scoped_cfs.setdefault(sec.name.casefold(), []).append(idx)
+                parsed_entries.append((idx, "cte_text", raw_entry))
+            else:
+                parsed_entries.append((idx, "global_text", raw_entry))
+            continue
+
+        if cte is not None:
+            if new_text is None or not isinstance(new_text, str):
+                raise InvalidArgumentError(
+                    f"Batch edit #{idx + 1}: new_text is required for whole-CTE replacement.",
+                    code="INVALID_ARGUMENT",
+                )
+            sec = _resolve_sql_section(struct, cte)
+            cf = sec.name.casefold()
+            if cf in whole_replaced_cfs:
+                raise InvalidArgumentError(
+                    f"Conflicting batch edits: SQL Section {sec.name!r} is replaced more than "
+                    f"once (edit #{whole_replaced_cfs[cf] + 1} and edit #{idx + 1}).",
+                    code="INVALID_ARGUMENT",
+                )
+            whole_replaced_cfs[cf] = idx
+            parsed_entries.append((idx, "whole_cte", raw_entry))
+            continue
+
+        raise InvalidArgumentError(
+            f"Batch edit #{idx + 1}: specify old_text, cte, start_line/end_line, "
+            "after_cte/before_cte, or delete_cte=True.",
+            code="INVALID_ARGUMENT",
+        )
+
+    # Cross-edit semantic conflict validation
+    for cf, del_idx in deleted_cte_cfs.items():
+        if cf in whole_replaced_cfs:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: cannot delete and replace CTE {cf!r} "
+                f"(edit #{del_idx + 1} and edit #{whole_replaced_cfs[cf] + 1}).",
+                code="INVALID_ARGUMENT",
+            )
+        if cf in scoped_cfs:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: cannot delete and edit CTE {cf!r} "
+                f"(edit #{del_idx + 1} and edit #{scoped_cfs[cf][0] + 1}).",
+                code="INVALID_ARGUMENT",
+            )
+    for anchor_cf, ins_idx, anchor_label in anchor_refs:
+        if anchor_cf in deleted_cte_cfs:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: edit #{ins_idx + 1} uses deleted CTE "
+                f"{anchor_label!r} as an insertion anchor "
+                f"(deleted in edit #{deleted_cte_cfs[anchor_cf] + 1}).",
+                code="INVALID_ARGUMENT",
+            )
+    for cf, rep_idx in whole_replaced_cfs.items():
+        if cf in scoped_cfs:
+            raise InvalidArgumentError(
+                f"Conflicting batch edits: cannot combine whole-section replacement and "
+                f"scoped replacement on SQL Section {cf!r} "
+                f"(edit #{rep_idx + 1} and edit #{scoped_cfs[cf][0] + 1}).",
+                code="INVALID_ARGUMENT",
+            )
+
+    # Resolve all entries against the single pre-edit snapshot
+    all_patches: list[TextPatch] = []
+    notes_and_warnings: list[str] = []
+    total_replacements = 0
+
+    for idx, mode, entry in parsed_entries:
+        if mode == "delete_cte":
+            continue
+        if mode == "line_range":
+            patch = build_line_range_patch(
+                clean_sql,
+                start_line=entry.get("start_line"),
+                end_line=entry.get("end_line"),
+                new_text=entry["new_text"],
+                edit_index=idx,
+            )
+            all_patches.append(patch)
+            total_replacements += 1
+        elif mode == "whole_cte":
+            patch, _, notes = build_whole_cte_replace_patch(
+                clean_sql,
+                struct,
+                cte=entry["cte"],
+                new_text=entry["new_text"],
+                edit_index=idx,
+            )
+            all_patches.append(patch)
+            notes_and_warnings.extend(notes)
+            total_replacements += 1
+        elif mode == "insert_cte":
+            patch, _, notes = build_cte_insert_patch(
+                clean_sql,
+                struct,
+                cte=entry["cte"],
+                new_text=entry["new_text"],
+                after_cte=entry.get("after_cte"),
+                before_cte=entry.get("before_cte"),
+                edit_index=idx,
+            )
+            all_patches.append(patch)
+            notes_and_warnings.extend(notes)
+            total_replacements += 1
+        elif mode in {"cte_text", "global_text"}:
+            entry_expected = entry.get("expected_replacements")
+            if mode == "cte_text":
+                sec = _resolve_sql_section(struct, entry["cte"])
+                scope_start, scope_end = _section_text_scope(clean_sql, sec)
+                label = f"replace in {sec.name!r}"
+                scope_desc = f" in SQL Section {sec.name!r}"
+            else:
+                scope_start, scope_end = 0, len(clean_sql)
+                label = "replace text"
+                scope_desc = ""
+            patches, count, _ = _find_text_edit_patches(
+                clean_sql,
+                scope_start,
+                scope_end,
+                old_text=entry["old_text"],
+                new_text=entry["new_text"],
+                expected_replacements=entry_expected,
+                edit_index=idx,
+                label=label,
+            )
+            if entry_expected is not None and count != entry_expected:
+                raise PreconditionFailedError(
+                    f"Batch edit #{idx + 1}: expected {entry_expected} replacement(s)"
+                    f"{scope_desc}, but found {count}; no edits were applied.",
+                    code="PRECONDITION_FAILED",
+                    expected=entry_expected,
+                    actual=count,
+                )
+            if count == 0:
+                raise PreconditionFailedError(
+                    f"Batch edit #{idx + 1}: matched 0 occurrences of old_text"
+                    f"{scope_desc}; no edits were applied.",
+                    code="PRECONDITION_FAILED",
+                    expected=1,
+                    actual=0,
+                )
+            all_patches.extend(patches)
+            total_replacements += count
+
+    deleted_names: list[str] = []
+    if delete_entries:
+        del_patches, deleted_names = build_cte_delete_patches(
+            clean_sql,
+            struct,
+            delete_entries,
+            insert_slots=insert_slots or None,
+        )
+        all_patches.extend(del_patches)
+        total_replacements += len(delete_entries)
+
+    _validate_non_overlapping_patches(all_patches)
+    updated_clean = apply_text_patches(clean_sql, all_patches)
+    notes_and_warnings.extend(
+        detect_deleted_cte_reference_warnings(updated_clean, deleted_names)
+    )
+    if updated_clean == clean_sql:
+        return clean_sql, 0, notes_and_warnings
+    return updated_clean, total_replacements, notes_and_warnings
 
 
 def _validate_m_expr_balance(expr: str) -> None:

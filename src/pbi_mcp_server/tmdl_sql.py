@@ -22,8 +22,13 @@ from .m_codec import (
     split_clean_sql_segments,
 )
 from .sql_edit import (
+    apply_batch_edits,
+    apply_cte_delete_edit,
+    apply_cte_insert_edit,
+    apply_cte_scoped_text_edit,
     apply_line_range_edit,
     apply_text_edit,
+    apply_whole_cte_replace_edit,
     detect_dynamic_param_warnings,
     strip_line_number_prefixes,
     validate_clean_sql_delimiters,
@@ -1113,28 +1118,82 @@ def update_table_sql(
     table: str | None = None,
     partition: str | None = None,
     relative_file: str | None = None,
+    cte: str | None = None,
     start_line: int | None = None,
     end_line: int | None = None,
+    after_cte: str | None = None,
+    before_cte: str | None = None,
+    delete_cte: bool = False,
+    edits: list[dict[str, Any]] | None = None,
     expected_replacements: int | None = None,
     expected_sql_hash: str | None = None,
     dry_run: bool = True,
     create_backups: bool = True,
 ) -> dict[str, Any]:
     has_line_range = start_line is not None or end_line is not None
-    if old_text is not None and has_line_range:
-        raise InvalidArgumentError(
-            "Cannot combine old_text with start_line/end_line; choose one edit target mode.",
-            code="INVALID_ARGUMENT",
-        )
-    if old_text is None and not has_line_range:
-        raise InvalidArgumentError(
-            "Provide either old_text or start_line/end_line to target a SQL edit.",
-            code="INVALID_ARGUMENT",
-        )
-    if new_text is None:
-        raise InvalidArgumentError("new_text is required.", code="INVALID_ARGUMENT")
-    if not has_line_range and not old_text:
-        raise InvalidArgumentError("old_text must not be empty.", code="INVALID_ARGUMENT")
+    has_insert_anchor = after_cte is not None or before_cte is not None
+    if edits is not None:
+        if (
+            old_text is not None
+            or new_text is not None
+            or cte is not None
+            or has_line_range
+            or has_insert_anchor
+            or delete_cte
+        ):
+            raise InvalidArgumentError(
+                "Cannot combine edits=[...] with top-level old_text, new_text, cte, "
+                "start_line/end_line, after_cte/before_cte, or delete_cte.",
+                code="INVALID_ARGUMENT",
+            )
+        if not isinstance(edits, list) or not edits:
+            raise InvalidArgumentError(
+                "edits must be a non-empty list of edit objects.",
+                code="INVALID_ARGUMENT",
+            )
+    elif delete_cte:
+        if cte is None:
+            raise InvalidArgumentError(
+                "cte is required when delete_cte=True.",
+                code="INVALID_ARGUMENT",
+            )
+        if old_text is not None or new_text is not None or has_line_range or has_insert_anchor:
+            raise InvalidArgumentError(
+                "Cannot combine delete_cte=True with old_text, new_text, start_line/end_line, "
+                "or after_cte/before_cte.",
+                code="INVALID_ARGUMENT",
+            )
+    else:
+        if has_insert_anchor:
+            if cte is None:
+                raise InvalidArgumentError(
+                    "cte is required when using after_cte or before_cte.",
+                    code="INVALID_ARGUMENT",
+                )
+            if old_text is not None or has_line_range:
+                raise InvalidArgumentError(
+                    "Cannot combine after_cte/before_cte with old_text or start_line/end_line.",
+                    code="INVALID_ARGUMENT",
+                )
+        if old_text is not None and has_line_range:
+            raise InvalidArgumentError(
+                "Cannot combine old_text with start_line/end_line; choose one edit target mode.",
+                code="INVALID_ARGUMENT",
+            )
+        if cte is not None and has_line_range:
+            raise InvalidArgumentError(
+                "Cannot combine cte with start_line/end_line; choose one edit target mode.",
+                code="INVALID_ARGUMENT",
+            )
+        if old_text is None and not has_line_range and cte is None:
+            raise InvalidArgumentError(
+                "Provide old_text, cte, start_line/end_line, or edits to target a SQL edit.",
+                code="INVALID_ARGUMENT",
+            )
+        if new_text is None:
+            raise InvalidArgumentError("new_text is required.", code="INVALID_ARGUMENT")
+        if old_text is not None and not old_text:
+            raise InvalidArgumentError("old_text must not be empty.", code="INVALID_ARGUMENT")
 
     sources = _select_sources(
         semantic_model_dir,
@@ -1148,7 +1207,14 @@ def update_table_sql(
             code="OBJECT_NOT_FOUND",
             details={"table": table, "partition": partition, "relative_file": relative_file},
         )
-    if (has_line_range or expected_sql_hash is not None) and len(sources) > 1:
+    if (
+        edits is not None
+        or has_line_range
+        or has_insert_anchor
+        or delete_cte
+        or cte is not None
+        or expected_sql_hash is not None
+    ) and len(sources) > 1:
         raise AmbiguousObjectError(
             "Targeted Partition SQL edits require a single unambiguous source. "
             "Supply an exact table and/or partition.",
@@ -1176,7 +1242,38 @@ def update_table_sql(
     last_updated_m: str | None = None
     for source in sources:
         clean = source.clean_sql or source.sql_expression
-        if has_line_range:
+        if edits is not None:
+            updated_clean, count, batch_notes = apply_batch_edits(clean, edits)
+            warnings.extend(batch_notes)
+            if not count:
+                continue
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            reason = (
+                f"apply atomic batch of {len(edits)} SQL edit(s) in partition {source.partition!r}"
+            )
+        elif delete_cte:
+            assert cte is not None
+            updated_clean, count, sec_name, del_warnings = apply_cte_delete_edit(
+                clean,
+                cte=cte,
+            )
+            warnings.extend(del_warnings)
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            reason = f"delete CTE {sec_name!r} in partition {source.partition!r}"
+        elif has_line_range:
+            assert new_text is not None
             eff_new, _ = strip_line_number_prefixes(new_text)
             updated_clean, count = apply_line_range_edit(
                 clean,
@@ -1195,8 +1292,68 @@ def update_table_sql(
             warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
             eff_end = start_line if end_line is None else end_line
             reason = f"replace lines {start_line}-{eff_end} in partition {source.partition!r}"
+        elif has_insert_anchor:
+            assert cte is not None
+            assert new_text is not None
+            updated_clean, count, sec_name, cte_notes = apply_cte_insert_edit(
+                clean,
+                cte=cte,
+                new_text=new_text,
+                after_cte=after_cte,
+                before_cte=before_cte,
+            )
+            warnings.extend(cte_notes)
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            reason = f"insert CTE {sec_name!r} in partition {source.partition!r}"
+        elif cte is not None and old_text is not None:
+            assert new_text is not None
+            updated_clean, count, match_mode, sec_name = apply_cte_scoped_text_edit(
+                clean,
+                cte=cte,
+                old_text=old_text,
+                new_text=new_text,
+                expected_replacements=expected_replacements,
+            )
+            if not count:
+                continue
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            reason = (
+                f"replace SQL fragment ({match_mode}) in SQL Section {sec_name!r} "
+                f"of partition {source.partition!r}"
+            )
+        elif cte is not None:
+            assert new_text is not None
+            updated_clean, count, sec_name, cte_notes = apply_whole_cte_replace_edit(
+                clean,
+                cte=cte,
+                new_text=new_text,
+            )
+            warnings.extend(cte_notes)
+            if not count:
+                continue
+            validate_clean_sql_delimiters(updated_clean)
+            if source.descriptor is not None:
+                updated_m = encode_sql_to_m(updated_clean, source.descriptor)
+                validate_m_reencoding(updated_clean, updated_m, source.descriptor)
+            else:
+                updated_m = updated_clean
+            warnings.extend(detect_dynamic_param_warnings(clean, updated_clean))
+            reason = f"replace SQL Section {sec_name!r} in partition {source.partition!r}"
         else:
             assert old_text is not None
+            assert new_text is not None
             eff_old, old_stripped = strip_line_number_prefixes(old_text, reference_sql=clean)
             eff_new, _ = strip_line_number_prefixes(
                 new_text,
