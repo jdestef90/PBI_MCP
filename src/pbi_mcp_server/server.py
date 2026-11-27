@@ -441,6 +441,15 @@ def _build_server_and_tools(
             str | None,
             Field(description="Replacement SQL text (use '' to delete matched lines/text)."),
         ] = None,
+        cte: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "SQL Section name (top-level CTE or 'main', case-insensitive) to scope "
+                    "old_text replacement, replace whole CTE body, insert, or delete."
+                )
+            ),
+        ] = None,
         start_line: Annotated[
             int | None,
             Field(description="Inclusive 1-based start line in Clean SQL View to replace."),
@@ -448,6 +457,37 @@ def _build_server_and_tools(
         end_line: Annotated[
             int | None,
             Field(description="Inclusive 1-based end line in Clean SQL View to replace."),
+        ] = None,
+        after_cte: Annotated[
+            str | None,
+            Field(description="Insert new CTE `cte` immediately after this existing CTE name."),
+        ] = None,
+        before_cte: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Insert new CTE `cte` immediately before this existing SQL Section "
+                    "(supports 'main', bootstrapping WITH on non-CTE queries)."
+                )
+            ),
+        ] = None,
+        delete_cte: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When true, delete the CTE named by `cte` and fix adjacent commas/WITH."
+                )
+            ),
+        ] = False,
+        edits: Annotated[
+            list[dict[str, Any]] | None,
+            Field(
+                description=(
+                    "Optional atomic batch of edits evaluated against one pre-edit snapshot. "
+                    "Each entry supports old_text, new_text, cte, start_line, end_line, "
+                    "after_cte, before_cte, delete_cte."
+                )
+            ),
         ] = None,
         partition: Annotated[
             str | None,
@@ -494,8 +534,13 @@ def _build_server_and_tools(
             new_text,
             table_name=table_name,
             partition=partition,
+            cte=cte,
             start_line=start_line,
             end_line=end_line,
+            after_cte=after_cte,
+            before_cte=before_cte,
+            delete_cte=delete_cte,
+            edits=edits,
             expected_replacements=expected_replacements,
             expected_sql_hash=expected_sql_hash,
             dry_run=dry_run,
