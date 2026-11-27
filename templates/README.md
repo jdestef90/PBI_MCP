@@ -35,3 +35,13 @@ These templates bake the compact 20-tool Power BI (`PBI_MCP`) catalog into your 
    [GPT-OSS-20B]
    chat-template-file = /path/to/PBI_MCP/templates/gpt_oss.jinja
    ```
+
+> **Note on Partition SQL tools:** `get_table_sql` and `update_table_sql` return compact, unescaped plain text (**Clean SQL View**, outline-first **SQL Section** navigation, and clean-SQL unified diffs) by default (`format="text"`), keeping prompt/response token usage low for sub-30B models. Pass `format="json"` if a caller explicitly requires JSON.
+
+## Regenerating Checked-In Presets
+
+Whenever tool signatures or descriptions change, regenerate all seven checked-in presets so they stay in sync with the live catalog (enforced by `tests/test_meta_tools_and_jinja.py`):
+
+```bash
+pbi-mcp-server --export-jinja all --output-dir templates
+```
