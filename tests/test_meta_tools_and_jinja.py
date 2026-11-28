@@ -333,8 +333,9 @@ def test_checked_in_jinja_presets_match_live_renderer() -> None:
     assert actual_files == expected_files
 
     for preset in PRESET_NAMES:
-        checked_in = (templates_dir / f"{preset}.jinja").read_bytes()
-        expected = render_preset_template(preset, catalog).encode("utf-8")
+        raw_text = (templates_dir / f"{preset}.jinja").read_text(encoding="utf-8")
+        checked_in = raw_text.replace("\r\n", "\n")
+        expected = render_preset_template(preset, catalog).replace("\r\n", "\n")
         assert checked_in == expected, (
             f"Checked-in template templates/{preset}.jinja is out of sync with live catalog. "
             "Run: pbi-mcp-server --export-jinja all --output-dir templates"
