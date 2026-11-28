@@ -16,25 +16,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
       - name: Install Python test & build tools
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" build twine
+          python -m pip install -e . --group dev
+          python -m pip install build twine
 
       - name: Run Python test suite
-        run: pytest -v
+        run: python -m pytest -v
 
       - name: Run npm launcher tests
         working-directory: npm
@@ -50,7 +51,7 @@ jobs:
         run: npm pack --dry-run
 
       - name: Upload Python dist artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist
           path: dist/
@@ -67,7 +68,7 @@ jobs:
       id-token: write
     steps:
       - name: Download Python dist artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-dist
           path: dist/
@@ -88,10 +89,10 @@ jobs:
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
