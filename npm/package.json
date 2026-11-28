@@ -1,0 +1,41 @@
+{
+  "name": "pbi-mcp-server",
+  "version": "0.3.0",
+  "description": "NPX launcher for pbi-mcp-server — local-first MCP server for inspecting and safely editing Power BI PBIP projects",
+  "license": "GPL-3.0-or-later",
+  "author": "Justin DeStefano",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jdestef90/PBI_MCP.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/jdestef90/PBI_MCP#readme",
+  "bugs": {
+    "url": "https://github.com/jdestef90/PBI_MCP/issues"
+  },
+  "keywords": [
+    "powerbi",
+    "pbip",
+    "tmdl",
+    "pbir",
+    "dax",
+    "databricks",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "bin": {
+    "pbi-mcp-server": "bin/pbi-mcp-server.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

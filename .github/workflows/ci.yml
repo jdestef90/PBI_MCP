@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout repository
@@ -32,3 +32,23 @@ jobs:
 
       - name: Run pytest suite
         run: pytest -v
+
+  npm-launcher:
+    name: npm Launcher Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run npm launcher tests
+        working-directory: npm
+        run: npm test && npm pack --dry-run
