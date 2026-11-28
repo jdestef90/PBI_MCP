@@ -6,7 +6,7 @@
   "author": "Justin DeStefano",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jdestef90/PBI_MCP.git",
+    "url": "git+https://github.com/jdestef90/PBI_MCP.git",
     "directory": "npm"
   },
   "homepage": "https://github.com/jdestef90/PBI_MCP#readme",
