@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+from . import __version__
 from .jinja_templates import (
     PRESET_NAMES,
     inject_into_base_template,
@@ -20,6 +21,11 @@ from .workspace_registry import WorkspaceRegistry
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Local MCP server for Power BI PBIP projects"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     group = parser.add_mutually_exclusive_group(required=False)
@@ -68,16 +74,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     args = parser.parse_args(argv)
-    if args.export_jinja is None and not args.base_template:
-        if not args.workspace and not args.workspace_roots:
-            env_ws = os.getenv("PBI_WORKSPACE_PATH")
-            if env_ws:
-                args.workspace = env_ws
-            else:
-                parser.error(
-                    "one of the arguments --workspace --workspace-root "
-                    "(or PBI_WORKSPACE_PATH) is required"
-                )
+    if (
+        args.export_jinja is None
+        and not args.base_template
+        and not args.workspace
+        and not args.workspace_roots
+    ):
+        env_ws = os.getenv("PBI_WORKSPACE_PATH")
+        if env_ws:
+            args.workspace = env_ws
+        else:
+            parser.error(
+                "one of the arguments --workspace --workspace-root "
+                "(or PBI_WORKSPACE_PATH) is required"
+            )
     return args
 
 

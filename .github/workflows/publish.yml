@@ -1,0 +1,103 @@
+name: Publish to PyPI and npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate packages without publishing"
+        type: boolean
+        default: true
+
+jobs:
+  build-and-verify:
+    name: Build & Verify Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python test & build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" build twine
+
+      - name: Run Python test suite
+        run: pytest -v
+
+      - name: Run npm launcher tests
+        working-directory: npm
+        run: npm test
+
+      - name: Build Python sdist and wheel
+        run: |
+          python -m build
+          twine check dist/*
+
+      - name: Dry-run npm pack
+        working-directory: npm
+        run: npm pack --dry-run
+
+      - name: Upload Python dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-and-verify
+    if: ${{ github.event_name == 'release' || inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pbi-mcp-server
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Python dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: Publish distribution to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-npm:
+    name: Publish to npm
+    needs: [build-and-verify, publish-pypi]
+    if: ${{ github.event_name == 'release' || inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/pbi-mcp-server
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish npm launcher package
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

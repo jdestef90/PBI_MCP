@@ -1,8 +1,32 @@
 [project]
 name = "pbi-mcp-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first MCP server for inspecting and safely editing Power BI PBIP projects"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Justin DeStefano" },
+]
+keywords = [
+  "powerbi",
+  "pbip",
+  "tmdl",
+  "pbir",
+  "dax",
+  "databricks",
+  "mcp",
+  "model-context-protocol",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+]
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "jmespath>=1.0.1",
@@ -10,6 +34,11 @@ dependencies = [
   "pydantic>=2.12,<3",
   "tmdl-parser>=0.2.0,<0.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jdestef90/PBI_MCP"
+Repository = "https://github.com/jdestef90/PBI_MCP"
+Issues = "https://github.com/jdestef90/PBI_MCP/issues"
 
 [project.scripts]
 pbi-mcp-server = "pbi_mcp_server.main:main"

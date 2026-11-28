@@ -101,11 +101,57 @@ In addition to the 20 tools above, the server exposes **MCP Resources** (for ins
 
 ---
 
-## Running Locally
+## Installation & Quick Start
+
+### Option 1: `npx` (Node.js 18+ + `uv` or Python 3.11–3.12)
 
 ```bash
-# Run full test suite
+# Inspect / edit a single PBIP project
+npx -y pbi-mcp-server --workspace ./sample_project.pbip
+
+# Serve all PBIP projects under a root directory
+npx -y pbi-mcp-server --workspace-root "/path/to/pbip-projects"
+```
+
+Example MCP client config (Claude Desktop, Cursor, VS Code):
+
+```json
+{
+  "mcpServers": {
+    "pbi-local": {
+      "command": "npx",
+      "args": ["-y", "pbi-mcp-server", "--workspace-root", "C:\\Users\\you\\PowerBI"]
+    }
+  }
+}
+```
+
+> The `npx` package delegates directly to `uvx` if [`uv`](https://docs.astral.sh/uv/) is installed (automatically managing Python 3.12), or falls back to a cached local Python 3.11–3.12 virtual environment. All diagnostics write to `stderr` so MCP `stdio` JSON-RPC framing stays clean.
+
+### Option 2: `uvx` / `pip` (Python)
+
+```bash
+# Zero-install via uvx (once published to PyPI)
+uvx pbi-mcp-server --workspace ./sample_project.pbip
+
+# Or directly from GitHub
+uvx --from git+https://github.com/jdestef90/PBI_MCP pbi-mcp-server --workspace ./sample_project.pbip
+
+# Or install with pip
+pip install pbi-mcp-server
+pbi-mcp-server --workspace ./sample_project.pbip
+```
+
+---
+
+## Running Locally (Development)
+
+```bash
+# Run full Python test suite
 .venv/bin/pytest
+
+# Run npm launcher tests
+npm --prefix npm test
 
 # Start server for a single PBIP project
 .venv/bin/pbi-mcp-server --workspace ./sample_project.pbip
