@@ -10,6 +10,7 @@ from .errors import AmbiguousWorkspaceError, InvalidArgumentError, WorkspaceNotF
 from .m_codec import format_get_table_sql_json, format_get_table_sql_text
 from .meta_tools import ToolSpec, build_pbi_help, dispatch_pbi_call, extract_tool_specs
 from .service import PbipService
+from .sql_edit import format_update_table_sql_text
 from .workspace_registry import WorkspaceRegistry
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -43,6 +44,22 @@ OffsetArg = Annotated[
 ]
 
 
+def _normalize_output_format(format_value: Any) -> Literal["text", "json"]:
+    """Validate and normalize output format for plain-text/JSON MCP SQL tools."""
+    if format_value is None:
+        return "text"
+    if isinstance(format_value, str):
+        fmt = format_value.strip().lower()
+        if fmt == "text":
+            return "text"
+        if fmt == "json":
+            return "json"
+    raise InvalidArgumentError(
+        f"Unsupported format {format_value!r}; expected 'text' or 'json'.",
+        code="INVALID_ARGUMENT",
+    )
+
+
 def _build_server_and_tools(
     backend: Backend, *, meta_tools: bool = False
 ) -> tuple[MCPServer, dict[str, Callable[..., Any]]]:
@@ -53,7 +70,7 @@ def _build_server_and_tools(
     def register_tool(fn: F) -> F:
         tools_map[fn.__name__] = fn
         if not meta_tools:
-            structured = False if fn.__name__ == "get_table_sql" else None
+            structured = False if fn.__name__ in {"get_table_sql", "update_table_sql"} else None
             mcp.add_tool(fn, structured_output=structured)
         return fn
 
@@ -189,6 +206,61 @@ def _build_server_and_tools(
                 description="Optional partition name if the table has multiple SQL partitions."
             ),
         ] = None,
+        outline: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When true, return only the structural outline (SQL Sections or clause "
+                    "landmarks) without SQL body for any query size."
+                )
+            ),
+        ] = False,
+        ctes: Annotated[
+            list[str] | str | None,
+            Field(
+                description=(
+                    "Optional SQL Section name or list of names (case-insensitive, supports "
+                    "'main') to read with canonical 1-based line numbers (400-line ceiling)."
+                )
+            ),
+        ] = None,
+        start_line: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional inclusive 1-based start line (defaults to a 120-line window "
+                    "when end_line is omitted)."
+                )
+            ),
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional inclusive 1-based end line (starts at line 1 when start_line "
+                    "is omitted)."
+                )
+            ),
+        ] = None,
+        search: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional case-insensitive substring to search across Clean SQL View "
+                    "(workspace-wide when table_name is omitted, or scoped by table_name, "
+                    "partition, and ctes)."
+                )
+            ),
+        ] = None,
+        context_lines: Annotated[
+            int,
+            Field(
+                description=(
+                    "Number of surrounding context lines to include around each search match "
+                    "(default 2, must be >= 0)."
+                )
+            ),
+        ] = 2,
         format: Annotated[
             Literal["text", "json"],
             Field(
@@ -199,20 +271,17 @@ def _build_server_and_tools(
         ] = "text",
         workspace: WorkspaceArg = None,
     ) -> str | dict[str, Any]:
-        """Extract Partition SQL (Clean SQL View with line numbers) for a table."""
-        if format is None:
-            fmt = "text"
-        elif isinstance(format, str):
-            fmt = format.strip().lower()
-        else:
-            fmt = ""
-        if fmt not in {"text", "json"}:
-            raise InvalidArgumentError(
-                f"Unsupported format {format!r}; expected 'text' or 'json'.",
-                code="INVALID_ARGUMENT",
-            )
+        """Extract or search Partition SQL (Clean SQL View or outline) across workspace, table, or SQL Sections."""  # noqa: E501
+        fmt = _normalize_output_format(format)
         data = get_service(workspace).get_table_sql(
-            table_name=table_name, partition=partition
+            table_name=table_name,
+            partition=partition,
+            outline=outline,
+            ctes=ctes,
+            start_line=start_line,
+            end_line=end_line,
+            search=search,
+            context_lines=context_lines,
         )
         if fmt == "json":
             return format_get_table_sql_json(data)
@@ -366,11 +435,65 @@ def _build_server_and_tools(
 
     @register_tool
     def update_table_sql(
-        old_text: Annotated[str, Field(description="Exact SQL line or block to replace.")],
-        new_text: Annotated[str, Field(description="Replacement SQL line or block.")],
         table_name: Annotated[
             str | None,
             Field(description="Table name containing the SQL partition."),
+        ] = None,
+        old_text: Annotated[
+            str | None,
+            Field(description="SQL text to replace (forgiving leading-whitespace match)."),
+        ] = None,
+        new_text: Annotated[
+            str | None,
+            Field(description="Replacement SQL text (use '' to delete matched lines/text)."),
+        ] = None,
+        cte: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "SQL Section name (top-level CTE or 'main', case-insensitive) to scope "
+                    "old_text replacement, replace whole CTE body, insert, or delete."
+                )
+            ),
+        ] = None,
+        start_line: Annotated[
+            int | None,
+            Field(description="Inclusive 1-based start line in Clean SQL View to replace."),
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(description="Inclusive 1-based end line in Clean SQL View to replace."),
+        ] = None,
+        after_cte: Annotated[
+            str | None,
+            Field(description="Insert new CTE `cte` immediately after this existing CTE name."),
+        ] = None,
+        before_cte: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Insert new CTE `cte` immediately before this existing SQL Section "
+                    "(supports 'main', bootstrapping WITH on non-CTE queries)."
+                )
+            ),
+        ] = None,
+        delete_cte: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When true, delete the CTE named by `cte` and fix adjacent commas/WITH."
+                )
+            ),
+        ] = False,
+        edits: Annotated[
+            list[dict[str, Any]] | None,
+            Field(
+                description=(
+                    "Optional atomic batch of edits evaluated against one pre-edit snapshot. "
+                    "Each entry supports old_text, new_text, cte, start_line, end_line, "
+                    "after_cte, before_cte, delete_cte."
+                )
+            ),
         ] = None,
         partition: Annotated[
             str | None,
@@ -380,18 +503,47 @@ def _build_server_and_tools(
             int | None,
             Field(description="Optional guard requiring an exact number of matches."),
         ] = None,
+        expected_sql_hash: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional precondition guard: sql_hash from get_table_sql that must "
+                    "match before editing."
+                )
+            ),
+        ] = None,
+        format: Annotated[
+            Literal["text", "json"],
+            Field(
+                description=(
+                    "Output format: 'text' (default, compact clean-SQL diff) or 'json'."
+                )
+            ),
+        ] = "text",
         workspace: WorkspaceArg = None,
         dry_run: DryRunArg = True,
-    ) -> dict[str, Any]:
-        """Surgically replace a line or block inside a table's Value.NativeQuery SQL expression."""
-        return get_service(workspace).update_table_sql(
+    ) -> str | dict[str, Any]:
+        """Safely edit a table's Partition SQL against the Clean SQL View with diff preview."""
+        fmt = _normalize_output_format(format)
+        plan = get_service(workspace).update_table_sql(
             old_text,
             new_text,
             table_name=table_name,
             partition=partition,
+            cte=cte,
+            start_line=start_line,
+            end_line=end_line,
+            after_cte=after_cte,
+            before_cte=before_cte,
+            delete_cte=delete_cte,
+            edits=edits,
             expected_replacements=expected_replacements,
+            expected_sql_hash=expected_sql_hash,
             dry_run=dry_run,
         )
+        if fmt == "json":
+            return plan
+        return format_update_table_sql_text(plan)
 
     @register_tool
     def update_visual_fields(

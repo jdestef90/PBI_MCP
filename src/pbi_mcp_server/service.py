@@ -45,6 +45,7 @@ from .mutation import (
     execute_mutation_pipeline,
     verify_expression_precondition,
 )
+from .sql_edit import build_clean_sql_diff
 from .tmdl_sql import (
     discover_partition_metadata,
     discover_tmdl_sql_sources,
@@ -76,6 +77,8 @@ class PbipService:
         self,
         modified_paths: list[Path],
         plan_dict: dict[str, Any],
+        *,
+        fallback_bytes: dict[Path, bytes] | None = None,
     ) -> dict[str, Any]:
         if not modified_paths:
             return plan_dict
@@ -83,7 +86,8 @@ class PbipService:
         plan_dict["validation"] = [i.model_dump() for i in validate(self.info)]
         if errors:
             for path in modified_paths:
-                restore_backup(path)
+                if not restore_backup(path) and fallback_bytes and path in fallback_bytes:
+                    path.write_bytes(fallback_bytes[path])
             plan_dict["rolled_back"] = True
             plan_dict["status"] = "rolled_back"
             plan_dict["error_code"] = "ROLLBACK_COMPLETED"
@@ -225,6 +229,18 @@ class PbipService:
                     "partitions": [s["partition"] for s in summaries],
                     "sql_hashes": {s["partition"]: s["sql_hash"] for s in summaries},
                     "line_counts": {s["partition"]: s["line_count"] for s in summaries},
+                    "sql_sections": {s["partition"]: s["sql_sections"] for s in summaries},
+                    "sql_section_counts": {
+                        s["partition"]: s["sql_section_count"] for s in summaries
+                    },
+                    "source_tables": {
+                        s["partition"]: list(s["sql_metadata"]["source_tables"])
+                        for s in summaries
+                    },
+                    "dynamic_parameters": {
+                        s["partition"]: list(s["sql_metadata"]["dynamic_parameters"])
+                        for s in summaries
+                    },
                 }
         return schema
 
@@ -311,6 +327,13 @@ class PbipService:
         self,
         table_name: str | None = None,
         partition: str | None = None,
+        *,
+        outline: bool = False,
+        ctes: list[str] | str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        search: str | None = None,
+        context_lines: int = 2,
     ) -> dict[str, Any]:
         if not self.info.semantic_model_dir:
             raise ObjectNotFoundError("Semantic model directory was not found.")
@@ -318,16 +341,30 @@ class PbipService:
             self.info.semantic_model_dir,
             table=table_name,
             partition=partition,
+            outline=outline,
+            ctes=ctes,
+            start_line=start_line,
+            end_line=end_line,
+            search=search,
+            context_lines=context_lines,
         )
 
     def update_table_sql(
         self,
-        old_text: str,
-        new_text: str,
+        old_text: str | None = None,
+        new_text: str | None = None,
         *,
         table_name: str | None = None,
         partition: str | None = None,
+        cte: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        after_cte: str | None = None,
+        before_cte: str | None = None,
+        delete_cte: bool = False,
+        edits: list[dict[str, Any]] | None = None,
         expected_replacements: int | None = None,
+        expected_sql_hash: str | None = None,
         dry_run: bool = True,
     ) -> dict[str, Any]:
         if not self.info.semantic_model_dir:
@@ -338,9 +375,15 @@ class PbipService:
             self.info.semantic_model_dir,
             table=table_name,
             partition=partition,
+            include_full_sql=True,
         )
         target_path = (self.info.semantic_model_dir / sql_before["file"]).resolve()
-        original_file_text = target_path.read_text(encoding="utf-8-sig")
+        original_file_bytes = target_path.read_bytes()
+        original_file_text = original_file_bytes.decode("utf-8-sig")
+
+        # Analyze impact before disk write (Mutation Pipeline stage order)
+        rel_file = relative(target_path, self.info.root)
+        impact_info = self.impact(sql_before["table"])
 
         plan_dict = mutate_table_sql(
             self.info.semantic_model_dir,
@@ -348,29 +391,39 @@ class PbipService:
             new_text,
             table=table_name,
             partition=partition,
+            cte=cte,
+            start_line=start_line,
+            end_line=end_line,
+            after_cte=after_cte,
+            before_cte=before_cte,
+            delete_cte=delete_cte,
+            edits=edits,
             expected_replacements=expected_replacements,
+            expected_sql_hash=expected_sql_hash,
             dry_run=dry_run,
             create_backups=self.create_backups,
         )
 
-        # Compute unified diff and impact summary
-        rel_file = relative(target_path, self.info.root)
-        impact_info = self.impact(sql_before["table"])
+        # Compute clean-SQL unified diff and attach impact summary
         plan_dict["target_object"] = f"{sql_before['table']}.{sql_before['partition']}"
+        plan_dict["file"] = rel_file
         plan_dict["changed_files"] = [rel_file] if plan_dict.get("replacement_count", 0) > 0 else []
         plan_dict["impact_summary"] = impact_info.get("counts")
 
         if plan_dict.get("replacement_count", 0) > 0:
-            if not dry_run:
-                updated_file_text = target_path.read_text(encoding="utf-8-sig")
-            else:
-                raw_before = sql_before.get("sql_m_expression", sql_before["sql"])
-                updated_file_text = original_file_text.replace(
-                    raw_before,
-                    plan_dict.get("updated_m_sql", raw_before),
-                    1,
+            before_clean = str(plan_dict.get("before_sql", sql_before.get("sql") or ""))
+            after_clean = str(plan_dict.get("updated_sql", before_clean))
+            if before_clean != after_clean:
+                diff_obj = build_clean_sql_diff(
+                    rel_file, before_clean, after_clean, context_lines=3
                 )
-            diff_obj = build_mutation_diff(rel_file, original_file_text, updated_file_text)
+            else:
+                updated_file_text = (
+                    target_path.read_text(encoding="utf-8-sig")
+                    if not dry_run
+                    else original_file_text
+                )
+                diff_obj = build_mutation_diff(rel_file, original_file_text, updated_file_text)
             plan_dict["diffs"] = [diff_obj.model_dump()]
             plan_dict["status"] = "dry_run" if dry_run else "applied"
         else:
@@ -383,7 +436,11 @@ class PbipService:
                 for ch in plan_dict.get("changes", [])
                 if "file" in ch
             ]
-            plan_dict = self._validate_or_rollback(modified, plan_dict)
+            plan_dict = self._validate_or_rollback(
+                modified,
+                plan_dict,
+                fallback_bytes={target_path: original_file_bytes},
+            )
 
         plan_dict["workflow"] = build_workflow_guidance(
             "sql_inspection_and_replacement",

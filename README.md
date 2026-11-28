@@ -6,13 +6,17 @@ Local-first MCP server for inspecting, auditing, and safely editing Power BI PBI
 
 ## Highlights
 
-- **Consolidated `src/pbi_mcp_server/` Architecture**: Clean package hierarchy separating Workspace Discovery (`workspace_registry`, `pbip_references`), Semantic Model (`engine_a`), Report Layout (`engine_b`), Cross-Layer Lineage (`lineage`), Standardized Mutations (`mutation`), Partition SQL (`tmdl_sql`), Analyst Superpowers (`analyst`), and Agent Workflows (`workflows`).
-- **Compact 20-Tool Surface**: Focused, high-leverage tools designed for LLM coding and analytics agents with optional pagination (`limit`, `offset`) and precondition guards (`expected_current_expression`, `expected_replacements`).
-- **Cross-Layer Dependency Graph**: Traces lineage from Partition SQL (`source_tables`, `sql_fields`) $\rightarrow$ TMDL Tables & Columns (`sourceColumn`) $\rightarrow$ DAX Calculated Columns & Measures $\rightarrow$ PBIR Visual Field Bindings & Report Pages.
+- **Consolidated `src/pbi_mcp_server/` Architecture**: Clean package hierarchy separating Workspace Discovery (`workspace_registry`, `pbip_references`), Semantic Model (`engine_a`), Report Layout (`engine_b`), Cross-Layer Lineage (`lineage`), Standardized Mutations (`mutation`), Partition SQL Codec, Sections & Editing (`m_codec`, `sql_sections`, `sql_edit`, `tmdl_sql`), Analyst Superpowers (`analyst`), Meta-Tools & Jinja Presets (`meta_tools`, `jinja_templates`), and Agent Workflows (`workflows`).
+- **Compact 20-Tool Surface (+ `--meta-tools` Mode)**: Focused, high-leverage tools designed for LLM coding and analytics agents with optional pagination (`limit`, `offset`) and precondition guards (`expected_current_expression`, `expected_replacements`, `expected_sql_hash`). Pass `--meta-tools` to collapse the surface to `pbi_call` and `pbi_help` alongside baked-in `llama-server` Jinja templates (`templates/`).
+- **Partition SQL Clean SQL View & Progressive CTE Editing**:
+  - Bidirectional M–SQL codec decodes fenced and unfenced TMDL partitions (`Value.NativeQuery`, `Databricks.Query`, and `[Query=...]` connectors like `Sql.Database`) into a 1-based line-numbered **Clean SQL View** with explicit `{{m:<expr>}}` **Dynamic M Parameter** placeholders, then re-encodes edits back into each partition's original M serialization style.
+  - Plain-text default MCP output (`format="text"`, opt-in `format="json"`) eliminates JSON newline/quote escaping and 4× payload duplication, while `get_table` returns summary-only Partition SQL metadata.
+  - Outline-first progressive disclosure (`> 120` lines) lists **SQL Sections** (top-level CTEs + `main`, or non-CTE clause landmarks) with canonical line ranges so agents can read specific `ctes`, `start_line`/`end_line` windows, or scoped `search` hits before applying forgiving text, line-range, CTE-scoped, whole-CTE, positional CTE insert/delete, or atomic batch `edits`.
+- **Cross-Layer Dependency Graph**: Traces lineage from Partition SQL (`source_tables`, `main` `sql_fields`) $\rightarrow$ TMDL Tables & Columns (`sourceColumn`) $\rightarrow$ DAX Calculated Columns & Measures $\rightarrow$ PBIR Visual Field Bindings & Report Pages.
 - **Hardened Mutation Pipeline**:
   - Ambiguity detection (`AMBIGUOUS_WORKSPACE`, `AMBIGUOUS_OBJECT`) before any analysis or edit.
-  - Precondition verification (`PRECONDITION_FAILED`) to prevent overwriting stale expressions.
-  - Unified diff previews (`MutationDiff`) during `dry_run=True`.
+  - Precondition verification (`PRECONDITION_FAILED`) via `expected_current_expression`, `expected_replacements`, and `expected_sql_hash` to prevent overwriting stale expressions.
+  - Unified diff previews (`MutationDiff` / clean-SQL unified diff) during `dry_run=True`.
   - Multi-file atomic backups and automatic rollback (`ROLLBACK_COMPLETED`) if post-write TMDL or PBIR validation fails.
 - **Expanded Power BI Analyst Toolkit**:
   - `find_unused_objects`: Detects unreferenced measures, unused columns, and dead-branch (`indirectly_referenced_only`) objects.
@@ -34,11 +38,11 @@ Local-first MCP server for inspecting, auditing, and safely editing Power BI PBI
 ### 2. Semantic Model Inspection & Search (5 tools)
 | Tool | Description |
 | :--- | :--- |
-| `list_tables(workspace?, limit?, offset=0)` | List tables with `object_id`, column/measure/partition counts, and `Value.NativeQuery` SQL status. |
-| `get_table(table_name, workspace?)` | Retrieve complete table schema (columns, measures, relationships, partition metadata, and SQL source). |
+| `list_tables(workspace?, limit?, offset=0)` | List tables with `object_id`, column/measure/partition counts, and Partition SQL status. |
+| `get_table(table_name, workspace?)` | Retrieve complete table schema (columns, measures, relationships, partition metadata, and summary-only Partition SQL metadata without the SQL body). |
 | `search_measures(query?, table?, workspace?, limit?, offset=0)` | Search across measure names, qualified names, DAX formulas, and descriptions. |
-| `get_table_sql(table_name?, partition?, workspace?)` | Extract partition SQL query with line numbers, M context, and parsed SQL metadata. |
-| `analyze_impact(term, workspace?)` | Cross-layer upstream (SQL, partitions, columns, measures) and downstream (measures, columns, relationships, visuals, pages) impact analysis. |
+| `get_table_sql(table_name?, partition?, outline=False, ctes?, start_line?, end_line?, search?, context_lines=2, format="text", workspace?)` | Return a table's **Clean SQL View** (unescaped plain text by default, or `format="json"`), outline-first structural summary (`> 120` lines or `outline=True`), targeted **SQL Sections** (`ctes`, including `"main"`), 1-based line ranges, or workspace/table/CTE-scoped `search` hits. |
+| `analyze_impact(term, workspace?)` | Cross-layer upstream (Partition SQL `main` projections & external source tables, partitions, columns, measures) and downstream (measures, columns, relationships, visuals, pages) impact analysis. |
 
 ### 3. Report Layout & Visuals (3 tools)
 | Tool | Description |
@@ -51,7 +55,7 @@ Local-first MCP server for inspecting, auditing, and safely editing Power BI PBI
 | Tool | Description |
 | :--- | :--- |
 | `update_measure_dax(measure_name, expression, table?, create_if_missing=False, format_string?, display_folder?, description?, expected_current_expression?, expected_replacements?, workspace?, dry_run=True)` | Update an existing measure's DAX or create a new measure (`create_if_missing=True`) with formatString, displayFolder, and unified diff output. |
-| `update_table_sql(old_text, new_text, table_name?, partition?, expected_replacements?, workspace?, dry_run=True)` | Surgically replace lines or blocks inside a table's `Value.NativeQuery` SQL with unified diffs. |
+| `update_table_sql(table_name?, old_text?, new_text?, cte?, start_line?, end_line?, after_cte?, before_cte?, delete_cte=False, edits?, partition?, expected_replacements?, expected_sql_hash?, format="text", workspace?, dry_run=True)` | Edit **Partition SQL** against the **Clean SQL View** via forgiving text replacement, 1-based line ranges, CTE-scoped or whole-CTE rewrites, positional CTE insertion (`after_cte`/`before_cte`), CTE deletion, or atomic batch `edits`, returning compact plain-text clean-SQL diffs by default (`format="json"` opt-in) while preserving **Dynamic M Parameters** and original M formatting. |
 | `update_visual_fields(visual_id_or_title, add_fields?, remove_fields?, page?, expected_replacements?, workspace?, dry_run=True)` | Add or remove measures/columns on visual roles without altering visual layout or styling. |
 | `rename_measure(old_name, new_name, table?, expected_replacements?, workspace?, dry_run=True)` | Atomically rename a measure across TMDL declarations, DAX formulas, and report visuals. |
 
@@ -108,13 +112,20 @@ In addition to the 20 tools above, the server exposes **MCP Resources** (for ins
 
 # Start server across one or more workspace root directories
 .venv/bin/pbi-mcp-server --workspace-root "/path/to/pbip-projects"
+
+# Start server in 2-tool meta-tools mode (for local llama-server + Jinja templates)
+.venv/bin/pbi-mcp-server --workspace ./sample_project.pbip --meta-tools
+
+# Regenerate all checked-in llama-server Jinja templates
+.venv/bin/pbi-mcp-server --export-jinja all --output-dir templates
 ```
 
 ---
 
 ## Domain & Architecture Documentation
 
-- [`GLOSSARY.md`](GLOSSARY.md): Ubiquitous domain language for PBIP workspaces, TMDL, PBIR, lineage, and mutations.
+- [`GLOSSARY.md`](GLOSSARY.md): Ubiquitous domain language for PBIP workspaces, TMDL, PBIR, Partition SQL, lineage, and mutations.
 - [`docs/agent-workflows.md`](docs/agent-workflows.md): Canonical multi-step agent workflow recipes and precondition guidelines.
-- [`docs/adr/`](docs/adr/): Architecture Decision Records (`0001` through `0005`).
+- [`templates/README.md`](templates/README.md): Local `llama-server` Jinja chat templates and `--meta-tools` usage.
+- [`docs/adr/`](docs/adr/): Architecture Decision Records (`0001` through `0006`).
 - [`docs/agents/`](docs/agents/): Engineering skill configurations for issue tracking and domain docs.

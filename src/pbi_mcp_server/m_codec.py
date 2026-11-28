@@ -42,18 +42,167 @@ def compute_sql_hash(clean_sql: str) -> str:
     return hashlib.sha256(clean_sql.encode("utf-8")).hexdigest()[:12]
 
 
-def format_numbered_sql(clean_sql: str, *, start_line: int = 1) -> str:
+def format_numbered_sql(
+    clean_sql: str, *, start_line: int = 1, width: int | None = None
+) -> str:
     """Format SQL with right-aligned canonical 1-based line numbers (`42 | ...`)."""
     lines = clean_sql.splitlines()
     if not lines:
         return ""
     max_line = start_line + len(lines) - 1
-    width = len(str(max_line))
-    return "\n".join(f"{idx:>{width}} | {line}" for idx, line in enumerate(lines, start_line))
+    pad = width if width is not None else len(str(max_line))
+    return "\n".join(f"{idx:>{pad}} | {line}" for idx, line in enumerate(lines, start_line))
+
+
+def _format_outline_body(data: dict[str, Any]) -> list[str]:
+    has_ctes = bool(data.get("has_ctes"))
+    sections: list[dict[str, Any]] = list(data.get("sections") or [])
+    clauses: list[dict[str, Any]] = list(data.get("clauses") or [])
+    out: list[str] = []
+
+    if has_ctes and sections:
+        out.append(f"SQL Sections ({len(sections)}):")
+        for sec in sections:
+            name = sec.get("name", "")
+            kind = sec.get("kind", "cte")
+            s_ln = sec.get("start_line", 1)
+            e_ln = sec.get("end_line", s_ln)
+            cnt = sec.get("line_count", e_ln - s_ln + 1)
+            parts = [f"- {name} ({kind}): lines {s_ln}-{e_ln} ({cnt} lines)"]
+            refs = list(sec.get("references_ctes") or [])
+            if refs:
+                parts.append("refs: " + ", ".join(refs))
+            srcs = list(sec.get("source_tables") or [])
+            if srcs:
+                parts.append("sources: " + ", ".join(srcs))
+            out.append(" | ".join(parts))
+    elif clauses:
+        out.append(f"SQL Clause Landmarks ({len(clauses)}):")
+        for cl in clauses:
+            name = cl.get("clause", "")
+            s_ln = cl.get("start_line", 1)
+            e_ln = cl.get("end_line", s_ln)
+            cnt = cl.get("line_count", e_ln - s_ln + 1)
+            out.append(f"- {name}: lines {s_ln}-{e_ln} ({cnt} lines)")
+    elif sections:
+        out.append(f"SQL Sections ({len(sections)}):")
+        for sec in sections:
+            s_ln = sec.get("start_line", 1)
+            e_ln = sec.get("end_line", s_ln)
+            cnt = sec.get("line_count", e_ln - s_ln + 1)
+            sec_name = sec.get("name", "main")
+            sec_kind = sec.get("kind", "main")
+            out.append(f"- {sec_name} ({sec_kind}): lines {s_ln}-{e_ln} ({cnt} lines)")
+
+    return out
+
+
+def _format_hunk_section_banner(hunk: dict[str, Any]) -> str:
+    match_sections: list[dict[str, Any]] = list(hunk.get("match_sections") or [])
+    grouped: list[tuple[str, list[int]]] = []
+    index_by_label: dict[str, int] = {}
+    for entry in match_sections:
+        label = str(entry.get("section") or "(preamble)")
+        ln = int(entry.get("line", 0))
+        if label not in index_by_label:
+            index_by_label[label] = len(grouped)
+            grouped.append((label, [ln]))
+        else:
+            lines_list = grouped[index_by_label[label]][1]
+            if ln not in lines_list:
+                lines_list.append(ln)
+
+    if not grouped:
+        s_ln = int(hunk.get("start_line", 1))
+        e_ln = int(hunk.get("end_line", s_ln))
+        return f"-- Lines {s_ln}-{e_ln}"
+
+    if len(grouped) == 1:
+        label, lns = grouped[0]
+        if len(lns) == 1:
+            return f"-- Section: {label} (line {lns[0]})"
+        return f"-- Section: {label} (lines {', '.join(str(x) for x in lns)})"
+
+    parts: list[str] = []
+    for label, lns in grouped:
+        if len(lns) == 1:
+            parts.append(f"{label} (line {lns[0]})")
+        else:
+            parts.append(f"{label} (lines {', '.join(str(x) for x in lns)})")
+    return "-- Sections: " + ", ".join(parts)
+
+
+def _format_search_sql_text(data: dict[str, Any]) -> str:
+    """Render compact, unescaped plain text for hierarchical SQL search results."""
+    query = str(data.get("search") or "")
+    context_lines = int(data.get("context_lines", 2))
+    table = data.get("table")
+    partition = data.get("partition")
+    ctes = data.get("ctes")
+    sources_searched = int(data.get("sources_searched", 0))
+    matched_sources = int(data.get("matched_sources", 0))
+    total_matches = int(data.get("total_matches", 0))
+    results: list[dict[str, Any]] = list(data.get("results") or [])
+
+    scope_parts: list[str] = []
+    if table:
+        scope_parts.append(f"table '{table}'")
+    if partition:
+        scope_parts.append(f"partition '{partition}'")
+    if ctes:
+        scope_parts.append("sections: " + ", ".join(str(c) for c in ctes))
+    scope_desc = ", ".join(scope_parts) if scope_parts else "workspace"
+
+    line_word = "line" if total_matches == 1 else "lines"
+    matched_src_word = "source" if matched_sources == 1 else "sources"
+    searched_src_word = "source" if sources_searched == 1 else "sources"
+
+    header = "\n".join([
+        f'SQL Search: "{query}" (scope: {scope_desc}, context_lines: {context_lines})',
+        (
+            f"Matches: {total_matches} {line_word} across {matched_sources} {matched_src_word} "
+            f"(searched {sources_searched} {searched_src_word})"
+        ),
+    ])
+
+    if not results:
+        return f'{header}\n\nNo matches found for "{query}".'
+
+    blocks: list[str] = [header]
+    for src in results:
+        src_table = src.get("table") or "<unknown>"
+        src_part = src.get("partition") or "<unknown>"
+        src_lines = int(src.get("line_count", 0))
+        src_hash = src.get("sql_hash") or ""
+        hunks: list[dict[str, Any]] = list(src.get("hunks") or [])
+        max_ln = max(
+            (int(h.get("end_line", 1)) for h in hunks),
+            default=1,
+        )
+        pad = len(str(max_ln))
+
+        src_block: list[str] = [
+            f"=== Table: {src_table} | Partition: {src_part} "
+            f"(lines: {src_lines}, sql_hash: {src_hash}) ==="
+        ]
+        for idx, hunk in enumerate(hunks):
+            if idx > 0:
+                src_block.append("")
+            src_block.append(_format_hunk_section_banner(hunk))
+            for item in hunk.get("lines") or []:
+                marker = ">" if item.get("is_match") else " "
+                ln_num = int(item.get("line", 0))
+                txt = str(item.get("text", ""))
+                src_block.append(f"{marker} {ln_num:>{pad}} | {txt}")
+        blocks.append("\n".join(src_block))
+
+    return "\n\n".join(blocks)
 
 
 def format_get_table_sql_text(data: dict[str, Any]) -> str:
     """Render compact, unescaped plain text for MCP get_table_sql."""
+    if data.get("view") == "search":
+        return _format_search_sql_text(data)
     table = data.get("table") or "<unknown>"
     partition = data.get("partition") or "<unknown>"
     mode = data.get("mode") or "unknown"
@@ -64,7 +213,9 @@ def format_get_table_sql_text(data: dict[str, Any]) -> str:
     meta = data.get("sql_metadata") or {}
     dyn_params: list[str] = list(meta.get("dynamic_parameters") or [])
     src_tables: list[str] = list(meta.get("source_tables") or [])
-    clean_sql: str = data.get("sql", "")
+    view = data.get("view") or "full"
+    warnings: list[str] = list(data.get("warnings") or [])
+    next_hints: list[str] = list(data.get("next_hints") or [])
 
     header = [
         f"Table: {table}",
@@ -76,16 +227,75 @@ def format_get_table_sql_text(data: dict[str, Any]) -> str:
     if src_tables:
         header.append("Source Tables: " + ", ".join(src_tables))
 
-    numbered = format_numbered_sql(clean_sql)
-    if numbered:
-        return "\n".join(header) + "\n\n" + numbered
-    return "\n".join(header)
+    blocks: list[str] = ["\n".join(header)]
+
+    if view == "outline":
+        outline_lines = _format_outline_body(data)
+        if outline_lines:
+            blocks.append("\n".join(outline_lines))
+    elif view == "ctes":
+        selected_sections: list[dict[str, Any]] = list(data.get("selected_sections") or [])
+        if selected_sections:
+            max_ln = max(int(s.get("returned_end_line", 1)) for s in selected_sections)
+            pad = len(str(max_ln))
+            for sec in selected_sections:
+                s_ret = int(sec.get("returned_start_line", 1))
+                e_ret = int(sec.get("returned_end_line", s_ret))
+                s_orig = int(sec.get("start_line", s_ret))
+                e_orig = int(sec.get("end_line", e_ret))
+                range_desc = (
+                    f"lines {s_ret}-{e_ret} of {s_orig}-{e_orig}"
+                    if sec.get("truncated")
+                    else f"lines {s_ret}-{e_ret}"
+                )
+                banner = (
+                    f"-- SQL Section: {sec.get('name', '')} "
+                    f"({sec.get('kind', 'cte')}, {range_desc})"
+                )
+                body = format_numbered_sql(sec.get("sql") or "", start_line=s_ret, width=pad)
+                blocks.append(f"{banner}\n{body}" if body else banner)
+    elif view == "lines":
+        clean_sql = data.get("sql") or ""
+        s_ln = int(data.get("start_line", 1))
+        e_ln = int(data.get("end_line", s_ln))
+        banner = f"-- Lines {s_ln}-{e_ln} of {line_count}"
+        numbered = format_numbered_sql(clean_sql, start_line=s_ln)
+        blocks.append(f"{banner}\n{numbered}" if numbered else banner)
+    else:
+        clean_sql = data.get("sql") or ""
+        numbered = format_numbered_sql(clean_sql)
+        if numbered:
+            blocks.append(numbered)
+
+    if warnings:
+        blocks.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
+    if next_hints:
+        blocks.append("Next:\n" + "\n".join(f"- {h}" for h in next_hints))
+
+    return "\n\n".join(blocks)
 
 
 def format_get_table_sql_json(data: dict[str, Any]) -> dict[str, Any]:
     """Return a lean structured dict for MCP get_table_sql(..., format='json')."""
+    view = data.get("view") or "full"
+    if view == "search":
+        return {
+            "view": "search",
+            "search": data.get("search"),
+            "scope": data.get("scope"),
+            "table": data.get("table"),
+            "partition": data.get("partition"),
+            "ctes": data.get("ctes"),
+            "context_lines": int(data.get("context_lines", 2)),
+            "case_sensitive": bool(data.get("case_sensitive", False)),
+            "sources_searched": int(data.get("sources_searched", 0)),
+            "matched_sources": int(data.get("matched_sources", 0)),
+            "total_matches": int(data.get("total_matches", 0)),
+            "total_occurrences": int(data.get("total_occurrences", 0)),
+            "results": list(data.get("results") or []),
+        }
     meta = data.get("sql_metadata") or {}
-    return {
+    out: dict[str, Any] = {
         "table": data.get("table"),
         "partition": data.get("partition"),
         "file": data.get("file"),
@@ -93,11 +303,26 @@ def format_get_table_sql_json(data: dict[str, Any]) -> dict[str, Any]:
         "connector": data.get("connector"),
         "line_count": data.get("line_count", 0),
         "sql_hash": data.get("sql_hash", ""),
+        "view": view,
+        "has_ctes": bool(data.get("has_ctes", False)),
         "dynamic_parameters": list(meta.get("dynamic_parameters") or []),
         "source_tables": list(meta.get("source_tables") or []),
         "selected_fields": list(meta.get("selected_fields") or []),
-        "sql": data.get("sql", ""),
+        "sections": list(data.get("sections") or []),
+        "clauses": list(data.get("clauses") or []),
+        "sql": data.get("sql"),
+        "warnings": list(data.get("warnings") or []),
+        "next_hints": list(data.get("next_hints") or []),
     }
+    if view == "ctes":
+        out["selected_sections"] = list(data.get("selected_sections") or [])
+        out["truncated"] = bool(data.get("truncated", False))
+        out["returned_line_count"] = int(data.get("returned_line_count", 0))
+        out["total_requested_lines"] = int(data.get("total_requested_lines", 0))
+    elif view == "lines":
+        out["start_line"] = int(data.get("start_line", 1))
+        out["end_line"] = int(data.get("end_line", 0))
+    return out
 
 
 def _skip_ws_and_comments(text: str, i: int, limit: int | None = None) -> int:
@@ -784,6 +1009,36 @@ def decode_m_sql_expression(
     return decoded, descriptor, dynamic_params
 
 
+def scan_m_placeholder_end(text: str, start: int) -> int:
+    """Return index immediately after `{{m:...}}` starting at `start`, or -1 if unclosed."""
+    n = len(text)
+    i = start + 4  # after "{{m:"
+    brace_depth = 0
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if text.startswith('""', i):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            if brace_depth == 0 and i + 1 < n and text[i + 1] == "}":
+                return i + 2
+            brace_depth = max(0, brace_depth - 1)
+        i += 1
+    return -1
+
+
 def split_clean_sql_segments(clean_sql: str) -> list[tuple[str, str]]:
     """Split Clean SQL View into `[('text', ...), ('expr', ...)]` segments."""
     segments: list[tuple[str, str]] = []
@@ -796,39 +1051,13 @@ def split_clean_sql_segments(clean_sql: str) -> list[tuple[str, str]]:
             break
         if match.start() > pos:
             segments.append(("text", clean_sql[pos : match.start()]))
-        expr_start = match.end()
-        brace_depth = 0
-        in_str = False
-        i = expr_start
-        closed_at: int | None = None
-        while i < n:
-            ch = clean_sql[i]
-            if in_str:
-                if clean_sql.startswith('""', i):
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_str = False
-                i += 1
-                continue
-            if ch == '"':
-                in_str = True
-                i += 1
-                continue
-            if ch == "{":
-                brace_depth += 1
-            elif ch == "}":
-                if brace_depth == 0 and i + 1 < n and clean_sql[i + 1] == "}":
-                    closed_at = i
-                    break
-                brace_depth = max(0, brace_depth - 1)
-            i += 1
-        if closed_at is None:
+        end_pos = scan_m_placeholder_end(clean_sql, match.start())
+        if end_pos < 0:
             # Unclosed placeholder: keep remainder as literal text
             segments.append(("text", clean_sql[match.start() :]))
             break
-        segments.append(("expr", clean_sql[expr_start:closed_at].strip()))
-        pos = closed_at + 2
+        segments.append(("expr", clean_sql[match.end() : end_pos - 2].strip()))
+        pos = end_pos
     return segments
 
 

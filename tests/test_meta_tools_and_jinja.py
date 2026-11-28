@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,17 +30,17 @@ def clone_sample_workspace(tmp_path: Path) -> Path:
     return tmp_path / "sample_project.pbip"
 
 
-def _parse_tool_result(res: object) -> dict[str, object] | list[object]:
+def _parse_tool_result(res: object) -> dict[str, Any] | list[Any]:
     """Extract JSON payload from MCPServer.call_tool result."""
     content = getattr(res, "content", res)
     if isinstance(content, list) and content:
-        items = [
+        items: list[Any] = [
             json.loads(getattr(item, "text", ""))
             for item in content
             if isinstance(getattr(item, "text", None), str)
         ]
-        if len(items) == 1:
-            return items[0]  # type: ignore[no-any-return]
+        if len(items) == 1 and isinstance(items[0], dict | list):
+            return items[0]
         if items:
             return items
     if isinstance(res, dict | list):
@@ -64,7 +65,7 @@ def test_pbi_help_lists_searches_and_inspects_tools(tmp_path: Path) -> None:
 
     filtered = _parse_tool_result(asyncio.run(srv.call_tool("pbi_help", {"query": "measure"})))
     assert isinstance(filtered, dict)
-    names = {t["tool_name"] for t in filtered["tools"]}  # type: ignore[index]
+    names = {t["tool_name"] for t in filtered["tools"]}
     assert "search_measures" in names
     assert "update_measure_dax" in names
 
@@ -73,7 +74,7 @@ def test_pbi_help_lists_searches_and_inspects_tools(tmp_path: Path) -> None:
     )
     assert isinstance(detail, dict)
     assert detail["tool_name"] == "update_measure_dax"
-    params = {p["name"]: p for p in detail["parameters"]}  # type: ignore[index]
+    params = {p["name"]: p for p in detail["parameters"]}
     assert params["measure_name"]["required"] is True
     assert params["dry_run"]["required"] is False
     assert params["dry_run"]["default"] is True
@@ -174,17 +175,169 @@ def test_inject_into_gemma4_and_gpt_oss_base_templates() -> None:
     specs = get_tool_specs()
     catalog = format_compact_catalog(specs)
 
-    gemma4_base = "{%- for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n{%- endfor %}"
+    gemma4_base = (
+        "{%- for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n{%- endfor %}"
+    )
     gemma4_out = inject_into_base_template(gemma4_base, catalog)
     assert "<|turn>system" in gemma4_out
     assert "list_workspaces" in gemma4_out
 
     harmony_base = (
-        "{%- for m in messages %}<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{%- endfor %}"
+        "{%- for m in messages %}"
+        "<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{%- endfor %}"
     )
     # Simulate Harmony template containing system<|message|> marker
     harmony_base_with_sys = "{# <|start|>system<|message|> #}\n" + harmony_base
     harmony_out = inject_into_base_template(harmony_base_with_sys, catalog)
     assert "<|start|>system<|message|>" in harmony_out
     assert "list_workspaces" in harmony_out
+
+
+def test_standard_and_meta_tools_mcp_surface_counts(tmp_path: Path) -> None:
+    pbip = clone_sample_workspace(tmp_path)
+
+    standard_srv = create_server(PbipService(pbip), meta_tools=False)
+    standard_names = [t.name for t in asyncio.run(standard_srv.list_tools())]
+    expected_tools = [
+        "list_workspaces",
+        "get_workspace",
+        "refresh_workspaces",
+        "list_tables",
+        "get_table",
+        "search_measures",
+        "get_table_sql",
+        "analyze_impact",
+        "list_report_pages",
+        "list_visuals",
+        "get_visual",
+        "update_measure_dax",
+        "update_table_sql",
+        "update_visual_fields",
+        "rename_measure",
+        "find_unused_objects",
+        "format_dax",
+        "generate_measure_docs",
+        "check_model_bpa",
+        "validate_workspace",
+    ]
+    assert len(standard_names) == 20
+    assert standard_names == expected_tools
+
+    meta_srv = create_server(PbipService(pbip), meta_tools=True)
+    meta_names = [t.name for t in asyncio.run(meta_srv.list_tools())]
+    assert meta_names == ["pbi_call", "pbi_help"]
+
+
+def test_pbi_help_and_compact_catalog_sql_tool_metadata(tmp_path: Path) -> None:
+    pbip = clone_sample_workspace(tmp_path)
+    srv = create_server(PbipService(pbip), meta_tools=True)
+
+    get_sql_help = _parse_tool_result(
+        asyncio.run(srv.call_tool("pbi_help", {"tool_name": "get_table_sql"}))
+    )
+    assert isinstance(get_sql_help, dict)
+    assert get_sql_help["tool_name"] == "get_table_sql"
+    get_params = {p["name"]: p for p in get_sql_help["parameters"]}
+
+    expected_get_params: dict[str, tuple[str, bool, object]] = {
+        "table_name": ("str", False, None),
+        "partition": ("str", False, None),
+        "outline": ("bool", False, False),
+        "ctes": ("list|str", False, None),
+        "start_line": ("int", False, None),
+        "end_line": ("int", False, None),
+        "search": ("str", False, None),
+        "context_lines": ("int", False, 2),
+        "format": ("'text'|'json'", False, "text"),
+        "workspace": ("str", False, None),
+    }
+    assert set(get_params) == set(expected_get_params)
+    for name, (expected_type, expected_req, expected_default) in expected_get_params.items():
+        param = get_params[name]
+        assert param["type"] == expected_type, f"get_table_sql.{name} type mismatch"
+        assert param["required"] is expected_req, f"get_table_sql.{name} required mismatch"
+        assert param["default"] == expected_default, f"get_table_sql.{name} default mismatch"
+        assert isinstance(param.get("description"), str) and param["description"].strip()
+
+    update_sql_help = _parse_tool_result(
+        asyncio.run(srv.call_tool("pbi_help", {"tool_name": "update_table_sql"}))
+    )
+    assert isinstance(update_sql_help, dict)
+    assert update_sql_help["tool_name"] == "update_table_sql"
+    update_params = {p["name"]: p for p in update_sql_help["parameters"]}
+
+    expected_update_params: dict[str, tuple[str, bool, object]] = {
+        "table_name": ("str", False, None),
+        "old_text": ("str", False, None),
+        "new_text": ("str", False, None),
+        "cte": ("str", False, None),
+        "start_line": ("int", False, None),
+        "end_line": ("int", False, None),
+        "after_cte": ("str", False, None),
+        "before_cte": ("str", False, None),
+        "delete_cte": ("bool", False, False),
+        "edits": ("list", False, None),
+        "partition": ("str", False, None),
+        "expected_replacements": ("int", False, None),
+        "expected_sql_hash": ("str", False, None),
+        "format": ("'text'|'json'", False, "text"),
+        "workspace": ("str", False, None),
+        "dry_run": ("bool", False, True),
+    }
+    assert set(update_params) == set(expected_update_params)
+    for name, (expected_type, expected_req, expected_default) in expected_update_params.items():
+        param = update_params[name]
+        assert param["type"] == expected_type, f"update_table_sql.{name} type mismatch"
+        assert param["required"] is expected_req, f"update_table_sql.{name} required mismatch"
+        assert param["default"] == expected_default, f"update_table_sql.{name} default mismatch"
+        assert isinstance(param.get("description"), str) and param["description"].strip()
+
+    # Verify pbi_help keyword search surfaces SQL navigation and CTE editing tools
+    cte_hits = _parse_tool_result(asyncio.run(srv.call_tool("pbi_help", {"query": "cte"})))
+    assert isinstance(cte_hits, dict)
+    cte_names = {t["tool_name"] for t in cte_hits["tools"]}
+    assert {"get_table_sql", "update_table_sql"}.issubset(cte_names)
+
+    # Verify compact catalog stays concise and readable for small-model system prompts
+    catalog = format_compact_catalog(get_tool_specs())
+    assert len(catalog) < 4500
+    assert len(catalog.splitlines()) <= 35
+    assert "typing." not in catalog
+    assert "NoneType" not in catalog
+    assert "Annotated" not in catalog
+    for option in (
+        "outline?: bool",
+        "ctes?: list|str",
+        "start_line?: int",
+        "end_line?: int",
+        "search?: str",
+        "context_lines?: int",
+        "format?: 'text'|'json'",
+        "cte?: str",
+        "after_cte?: str",
+        "before_cte?: str",
+        "delete_cte?: bool",
+        "edits?: list",
+        "expected_sql_hash?: str",
+    ):
+        assert option in catalog
+
+
+def test_checked_in_jinja_presets_match_live_renderer() -> None:
+    repo_root = Path(__file__).parents[1]
+    templates_dir = repo_root / "templates"
+    catalog = format_compact_catalog(get_tool_specs())
+
+    expected_files = {f"{preset}.jinja" for preset in PRESET_NAMES}
+    actual_files = {p.name for p in templates_dir.glob("*.jinja")}
+    assert actual_files == expected_files
+
+    for preset in PRESET_NAMES:
+        checked_in = (templates_dir / f"{preset}.jinja").read_bytes()
+        expected = render_preset_template(preset, catalog).encode("utf-8")
+        assert checked_in == expected, (
+            f"Checked-in template templates/{preset}.jinja is out of sync with live catalog. "
+            "Run: pbi-mcp-server --export-jinja all --output-dir templates"
+        )
+
 
